@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "test": "tsc --noEmit",
+    "test": "jest",
+    "typecheck": "tsc --noEmit",
     "start": "twilio-run --functions-folder dist/functions --assets-folder dist/assets",
     "deploy": "twilio-run deploy --functions-folder dist/functions --assets-folder dist/assets",
     "build": "tsc && npm run build:copy-assets",
@@ -13,13 +14,16 @@
   },
   "dependencies": {
     "@twilio-labs/serverless-runtime-types": "^4.0.0",
-    "twilio": "5.0.3",
-    "@twilio/runtime-handler": "2.0.3"
+    "@twilio/runtime-handler": "2.0.3",
+    "twilio": "5.0.3"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "copyfiles": "^2.4.1",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
     "twilio-run": "^5.0.0",
-    "typescript": "^5.3.3",
-    "copyfiles": "^2.4.1"
+    "typescript": "^5.3.3"
   },
   "engines": {
     "node": "^20.x || ^22.x"
