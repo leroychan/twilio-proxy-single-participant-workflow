@@ -89,12 +89,18 @@ it('says an error and hangs up when Digits are missing', (done) => {
 it('says an error and hangs up when session creation fails', (done) => {
   const context = makeContext();
   sessionsCreate.mockRejectedValue(new Error('boom'));
+  // The handler logs the caught error via console.error; silence it so the
+  // expected failure does not print as noise in the test output.
+  const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
   handler(
     context as any,
     { Digits: '123456', From: '+15551112222', To: '+15553334444' } as any,
     (err: any, response: any) => {
       expect(err).toBeFalsy();
+      expect(response.headers['Content-Type']).toBe('application/xml');
       expect(response.body).toContain('<Hangup');
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
       done();
     }
   );
