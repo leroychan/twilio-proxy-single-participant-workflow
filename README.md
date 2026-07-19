@@ -15,6 +15,7 @@ A caller dials a Proxy number that has no active session for them. Instead of fa
   - [Step-by-step](#step-by-step)
   - [Participant identities explained](#participant-identities-explained)
   - [The redirect trick](#the-redirect-trick)
+- [How the lookup should work (bidirectional)](#how-the-lookup-should-work-bidirectional)
 - [Environment variables](#environment-variables)
 - [Setup](#setup)
 - [Run locally](#run-locally)
@@ -181,6 +182,83 @@ https://webhooks.twilio.com/v1/Accounts/{ACCOUNT_SID}/Proxy/{PROXY_SERVICE_SID}/
 Redirecting the live call to this URL is what moves an ordinary inbound PSTN
 call *into* the freshly created Proxy Session. That's the mechanism that turns
 an out-of-session call into a proxied, connected call.
+
+---
+
+## How the lookup should work (bidirectional)
+
+A code (an "order") connects **two parties** — for example a **buyer** and a
+**courier**. The workflow must connect them **regardless of who calls first**:
+
+- Buyer dials the proxy number, enters the code → should reach the **courier**.
+- Courier dials the proxy number, enters the code → should reach the **buyer**.
+
+So `/lookup` must not map a code to a single fixed number. It must resolve the
+**other party** relative to whoever is calling. Two inputs make this possible,
+and `/gather-action` already sends both:
+
+- `Digits` — the entered code, identifying the order (the pair of parties).
+- `From` — the caller's real number, identifying **which** party is calling.
+
+The rule: *look up the order by `Digits`, find the caller within it by `From`,
+and return the counterparty's number.*
+
+### Direction resolution
+
+```mermaid
+flowchart TD
+    A["/lookup?Digits=CODE&From=CALLER"] --> B{Find order by CODE}
+    B -->|not found| D["fallback: DEFAULT_REAL_NUMBER"]
+    B -->|found| C{Which party is CALLER?}
+    C -->|CALLER == buyer| E["return courier number"]
+    C -->|CALLER == courier| F["return buyer number"]
+    C -->|CALLER matches neither| D
+```
+
+| Caller (`From`) is… | Return (`realNumber`) |
+|---------------------|-----------------------|
+| the **buyer**       | the **courier**'s number |
+| the **courier**     | the **buyer**'s number   |
+| neither / unknown   | `DEFAULT_REAL_NUMBER` (or reject) |
+
+### Data model
+
+Instead of `code → number`, store each order as a **pair** so either direction
+resolves. A production lookup would back this with a database keyed on the
+code; the mock can express it as JSON:
+
+```jsonc
+{
+  "123456": { "buyer": "+6590492680", "courier": "+6581234567" },
+  "654321": { "buyer": "+6599990000", "courier": "+6588887777" }
+}
+```
+
+Resolution pseudocode:
+
+```ts
+const order = orders[digits];
+if (!order) return DEFAULT_REAL_NUMBER;          // unknown code
+if (from === order.buyer)   return order.courier; // buyer → courier
+if (from === order.courier) return order.buyer;   // courier → buyer
+return DEFAULT_REAL_NUMBER;                        // caller not part of order
+```
+
+### Why this is symmetric with Proxy
+
+The rest of the flow already works both ways without changes: `/gather-action`
+adds the caller (`From`) as Participant 1 and the resolved counterparty as
+Participant 2, then redirects into Proxy. Because the lookup returns the
+counterparty relative to the caller, the exact same code path connects
+buyer→courier and courier→buyer — only the `/lookup` resolution differs by
+direction.
+
+> **Current state:** the shipped `/lookup` (`resolveRealNumber`) is a
+> simplified **one-directional** mock — it maps `code → number` using
+> `LOOKUP_MAP` and ignores `From`. To support the buyer↔courier use case,
+> replace it with the pair-based, `From`-aware resolution above (and update
+> `LOOKUP_MAP` to the paired structure or point `/lookup` at your real
+> service).
 
 ---
 
