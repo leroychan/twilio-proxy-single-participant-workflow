@@ -25,7 +25,8 @@ it('returns the mapped number as JSON for matching digits', (done) => {
     (err: any, response: any) => {
       expect(err).toBeFalsy();
       expect(response.headers['Content-Type']).toBe('application/json');
-      expect(JSON.parse(response.body)).toEqual({ realNumber: '+15551230000' });
+      // Body is the object; the runtime serializes it for the JSON response.
+      expect(response.body).toEqual({ realNumber: '+15551230000' });
       done();
     }
   );
@@ -37,7 +38,7 @@ it('returns the default number when digits do not match', (done) => {
     { Digits: '000000', From: '+15551112222' } as any,
     (err: any, response: any) => {
       expect(err).toBeFalsy();
-      expect(JSON.parse(response.body)).toEqual({ realNumber: '+15559999999' });
+      expect(response.body).toEqual({ realNumber: '+15559999999' });
       done();
     }
   );

@@ -34,6 +34,8 @@ export const handler: ServerlessFunctionSignature = function (
 
   const response = new Twilio.Response();
   response.appendHeader('Content-Type', 'application/json');
-  response.setBody(JSON.stringify({ realNumber }));
+  // Pass the object directly: the runtime JSON-serializes the body once for an
+  // application/json response. Pre-stringifying here would double-encode it.
+  response.setBody({ realNumber });
   return callback(null, response);
 };
