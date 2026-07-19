@@ -49,6 +49,9 @@ it('looks up the number, creates a session with both participants, and redirects
       const fetchUrl = (global as any).fetch.mock.calls[0][0] as string;
       expect(fetchUrl).toContain('https://svc-1234-dev.twil.io/lookup');
 
+      // session created voice-only so Proxy doesn't require SMS-capable numbers
+      expect(sessionsCreate).toHaveBeenCalledWith({ mode: 'voice-only' });
+
       // participant 1 = caller with proxyIdentifier = To
       expect(participantsCreate).toHaveBeenCalledWith({
         identifier: '+15551112222',

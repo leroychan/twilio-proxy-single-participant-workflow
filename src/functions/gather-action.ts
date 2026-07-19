@@ -71,9 +71,13 @@ export const handler: ServerlessFunctionSignature = async function (
     // 2. Create a Proxy Session with both participants.
     const client = context.getTwilioClient();
     const serviceSid = context.PROXY_SERVICE_SID as string;
+    // voice-only: this is a call-only flow, so Proxy should match a
+    // voice-capable proxy number and not require SMS capabilities. Without
+    // this, Proxy defaults to voice-and-message and fails with error 80202
+    // when no proxy number has both voice and SMS.
     const session = await client.proxy.v1
       .services(serviceSid)
-      .sessions.create({});
+      .sessions.create({ mode: 'voice-only' });
 
     // Participant 1: the caller, keyed to the proxy number they dialed.
     await client.proxy.v1
