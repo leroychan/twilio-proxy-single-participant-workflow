@@ -99,10 +99,8 @@ sequenceDiagram
     GA->>LK: GET /lookup?Digits=…&From=…
     LK-->>GA: { "realNumber": "+65…" }
 
-    Note over GA,Proxy: 2. Build the session
-    GA->>Proxy: Create Session
-    GA->>Proxy: Add Participant 1 (identifier=From, proxyIdentifier=To)
-    GA->>Proxy: Add Participant 2 (identifier=realNumber)
+    Note over GA,Proxy: 2. Build the session (single API call)
+    GA->>Proxy: Create Session (voice-only) with both participants nested<br/>P1: Identifier=From, ProxyIdentifier=To — P2: Identifier=realNumber
 
     Note over GA,Proxy: 3. Hand the live call to Proxy
     GA-->>Proxy: <Redirect> to Proxy Webhooks/Call URL
@@ -144,10 +142,13 @@ sequenceDiagram
    code is unknown or the map is malformed. It responds with
    `{ "realNumber": "+65…" }`.
 
-5. **Create the session.** `/gather-action` creates a new Proxy Session and
-   adds **two participants** (see below). This is the "single-participant
-   workflow" in action: the session is assembled programmatically rather than
-   pre-existing.
+5. **Create the session.** `/gather-action` creates a new Proxy Session with
+   **both participants nested inline — a single API call** (see below). This is
+   the "single-participant workflow" in action: the session is assembled
+   programmatically rather than pre-existing. Creating everything in one call
+   is also atomic — if a participant can't be added (e.g. no compatible proxy
+   number), the whole session creation fails and no half-built session is left
+   behind.
 
 6. **Redirect into Proxy.** Finally, `/gather-action` returns a `<Redirect>`
    pointing the *still-live* call at the Proxy Service's `Webhooks/Call`
@@ -161,7 +162,11 @@ sequenceDiagram
 
 ### Participant identities explained
 
-The two `participants.create` calls are what wire the call together:
+The session is created with both participants nested in the single
+`sessions.create({ mode: 'voice-only', participants: [...] })` call. The nested
+entries use the API's **PascalCase** field names (`Identifier` /
+`ProxyIdentifier`), not the camelCase used by the standalone participants
+endpoint. The two participants are what wire the call together:
 
 | Participant | `identifier` | `proxyIdentifier` | Meaning |
 |-------------|--------------|-------------------|---------|

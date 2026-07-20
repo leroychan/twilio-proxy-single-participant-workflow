@@ -49,18 +49,21 @@ it('looks up the number, creates a session with both participants, and redirects
       const fetchUrl = (global as any).fetch.mock.calls[0][0] as string;
       expect(fetchUrl).toContain('https://svc-1234-dev.twil.io/lookup');
 
-      // session created voice-only so Proxy doesn't require SMS-capable numbers
-      expect(sessionsCreate).toHaveBeenCalledWith({ mode: 'voice-only' });
-
-      // participant 1 = caller with proxyIdentifier = To
-      expect(participantsCreate).toHaveBeenCalledWith({
-        identifier: '+15551112222',
-        proxyIdentifier: '+15553334444',
+      // single API call: session created voice-only (so Proxy doesn't require
+      // SMS-capable numbers) with both participants nested inline, using the
+      // API's PascalCase field names.
+      //   participant 1 = caller with proxyIdentifier = To
+      //   participant 2 = target real number
+      expect(sessionsCreate).toHaveBeenCalledTimes(1);
+      expect(sessionsCreate).toHaveBeenCalledWith({
+        mode: 'voice-only',
+        participants: [
+          { Identifier: '+15551112222', ProxyIdentifier: '+15553334444' },
+          { Identifier: '+15551230000' },
+        ],
       });
-      // participant 2 = target real number
-      expect(participantsCreate).toHaveBeenCalledWith({
-        identifier: '+15551230000',
-      });
+      // participants are no longer created via the standalone endpoint
+      expect(participantsCreate).not.toHaveBeenCalled();
 
       // redirect TwiML with dynamic ACCOUNT_SID + PROXY_SERVICE_SID
       expect(response.headers['Content-Type']).toBe('application/xml');

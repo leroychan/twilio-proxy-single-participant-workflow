@@ -68,28 +68,27 @@ export const handler: ServerlessFunctionSignature = async function (
       throw new Error('Lookup returned no number');
     }
 
-    // 2. Create a Proxy Session with both participants.
+    // 2. Create a Proxy Session with both participants in a single API call.
     const client = context.getTwilioClient();
     const serviceSid = context.PROXY_SERVICE_SID as string;
     // voice-only: this is a call-only flow, so Proxy should match a
     // voice-capable proxy number and not require SMS capabilities. Without
     // this, Proxy defaults to voice-and-message and fails with error 80202
     // when no proxy number has both voice and SMS.
-    const session = await client.proxy.v1
-      .services(serviceSid)
-      .sessions.create({ mode: 'voice-only' });
-
-    // Participant 1: the caller, keyed to the proxy number they dialed.
-    await client.proxy.v1
-      .services(serviceSid)
-      .sessions(session.sid)
-      .participants.create({ identifier: From, proxyIdentifier: To });
-
-    // Participant 2: the real target number.
-    await client.proxy.v1
-      .services(serviceSid)
-      .sessions(session.sid)
-      .participants.create({ identifier: realNumber });
+    //
+    // The nested `participants` array is serialized verbatim into the
+    // `Participants` API parameter, so each entry must use the API's
+    // PascalCase field names (Identifier / ProxyIdentifier) rather than the
+    // camelCase used by the standalone participants.create() endpoint.
+    //   Participant 1: the caller, keyed to the proxy number they dialed.
+    //   Participant 2: the real target number.
+    await client.proxy.v1.services(serviceSid).sessions.create({
+      mode: 'voice-only',
+      participants: [
+        { Identifier: From, ProxyIdentifier: To },
+        { Identifier: realNumber },
+      ],
+    });
 
     // 3. Redirect the live call into Proxy to connect the two parties.
     const redirectUrl =
