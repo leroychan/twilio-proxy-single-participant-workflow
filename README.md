@@ -51,8 +51,10 @@ flowchart LR
     GA -->|Redirect TwiML| Proxy
     Proxy <-->|bridged call| Caller
     Proxy <-->|bridged call| Dest
-    Proxy -.lifecycle events.-> CB
-    Proxy -.intercept events.-> ICB
+    Proxy -. "lifecycle events (signed)" .-> CB
+    CB -. "close session when call ends" .-> Proxy
+    Proxy -. "intercept events" .-> ICB
+    ICB -. "allow (200)" .-> Proxy
 ```
 
 Everything runs on the Twilio Serverless (Functions) runtime. `/lookup` stands in for a real number-resolution REST API — swap it for your own service in production.
@@ -88,6 +90,7 @@ sequenceDiagram
     participant OOS as /out-of-session
     participant GA as /gather-action
     participant LK as /lookup
+    participant CB as /callback
     actor Dest as Destination
 
     Caller->>Proxy: Dials proxy number (To), no active session
@@ -110,7 +113,13 @@ sequenceDiagram
     Proxy->>Dest: Dials destination via proxy number
     Caller<<->>Dest: Connected through Proxy
 
-    Proxy-->>OOS: (session lifecycle → /callback, /intercept-callback)
+    Note over Proxy,CB: 4. Lifecycle events + early cleanup
+    Proxy->>CB: POST /callback (X-Twilio-Signature, outbound leg status)
+    Note right of CB: Validate signature<br/>(invalid → 403, no action)
+    CB-->>Proxy: 200
+    Proxy->>CB: POST /callback (outbound leg terminal:<br/>completed / busy / no-answer / failed / canceled)
+    CB->>Proxy: Close session → frees the proxy number (ttl=300 is the backstop)
+    CB-->>Proxy: 200
 ```
 
 ### Step-by-step
