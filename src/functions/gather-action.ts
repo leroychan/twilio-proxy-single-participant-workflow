@@ -68,27 +68,44 @@ export const handler: ServerlessFunctionSignature = async function (
       throw new Error('Lookup returned no number');
     }
 
-    // 2. Create a Proxy Session with both participants in a single API call.
+    // 2. Create a Proxy Session, then add the participants in two sequential
+    // calls. The ORDER matters and this must NOT be collapsed into a single
+    // sessions.create({ participants: [...] }) call:
+    //
+    //   The caller must keep the exact proxy number they dialed (To) as their
+    //   proxyIdentifier so the redirect below matches them back into this
+    //   session. If both participants are resolved at once, Proxy can assign
+    //   the SAME number to the destination (prefer-sticky + country geo-match
+    //   with a small number pool), colliding with the caller and dropping the
+    //   caller participant — the call then loops back to /out-of-session.
+    //
+    //   Adding the caller FIRST reserves To for them, forcing Proxy to pick a
+    //   different proxy number for the destination.
+    //
+    // voice-only: call-only flow, so Proxy matches a voice-capable proxy
+    // number and does not require SMS capabilities (avoids error 80202).
     const client = context.getTwilioClient();
     const serviceSid = context.PROXY_SERVICE_SID as string;
-    // voice-only: this is a call-only flow, so Proxy should match a
-    // voice-capable proxy number and not require SMS capabilities. Without
-    // this, Proxy defaults to voice-and-message and fails with error 80202
-    // when no proxy number has both voice and SMS.
-    //
-    // The nested `participants` array is serialized verbatim into the
-    // `Participants` API parameter, so each entry must use the API's
-    // PascalCase field names (Identifier / ProxyIdentifier) rather than the
-    // camelCase used by the standalone participants.create() endpoint.
-    //   Participant 1: the caller, keyed to the proxy number they dialed.
-    //   Participant 2: the real target number.
-    await client.proxy.v1.services(serviceSid).sessions.create({
+    // uniqueName: human-readable "<caller> -> <destination>" (actual numbers).
+    // ttl: 300s (5 min) so the session — and the proxy numbers it holds — free
+    // themselves 5 minutes after the last interaction.
+    const session = await client.proxy.v1.services(serviceSid).sessions.create({
+      uniqueName: `${From} -> ${realNumber}`,
       mode: 'voice-only',
-      participants: [
-        { Identifier: From, ProxyIdentifier: To },
-        { Identifier: realNumber },
-      ],
+      ttl: 300,
     });
+
+    // Participant 1: the caller, pinned to the proxy number they dialed.
+    await client.proxy.v1
+      .services(serviceSid)
+      .sessions(session.sid)
+      .participants.create({ identifier: From, proxyIdentifier: To });
+
+    // Participant 2: the real target number (Proxy assigns a free number).
+    await client.proxy.v1
+      .services(serviceSid)
+      .sessions(session.sid)
+      .participants.create({ identifier: realNumber });
 
     // 3. Redirect the live call into Proxy to connect the two parties.
     const redirectUrl =

@@ -14,6 +14,7 @@ A caller dials a Proxy number that has no active session for them. Instead of fa
   - [Sequence diagram](#sequence-diagram)
   - [Step-by-step](#step-by-step)
   - [Participant identities explained](#participant-identities-explained)
+  - [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)
   - [The redirect trick](#the-redirect-trick)
 - [How the lookup should work (bidirectional)](#how-the-lookup-should-work-bidirectional)
 - [Environment variables](#environment-variables)
@@ -99,8 +100,10 @@ sequenceDiagram
     GA->>LK: GET /lookup?Digits=…&From=…
     LK-->>GA: { "realNumber": "+65…" }
 
-    Note over GA,Proxy: 2. Build the session (single API call)
-    GA->>Proxy: Create Session (voice-only) with both participants nested<br/>P1: Identifier=From, ProxyIdentifier=To — P2: Identifier=realNumber
+    Note over GA,Proxy: 2. Build the session (3 sequential calls — see note)
+    GA->>Proxy: Create Session (uniqueName "From -> realNumber", voice-only, ttl=300)
+    GA->>Proxy: Add Participant 1 — caller (identifier=From, proxyIdentifier=To)
+    GA->>Proxy: Add Participant 2 — destination (identifier=realNumber, auto proxy #)
 
     Note over GA,Proxy: 3. Hand the live call to Proxy
     GA-->>Proxy: <Redirect> to Proxy Webhooks/Call URL
@@ -142,13 +145,18 @@ sequenceDiagram
    code is unknown or the map is malformed. It responds with
    `{ "realNumber": "+65…" }`.
 
-5. **Create the session.** `/gather-action` creates a new Proxy Session with
-   **both participants nested inline — a single API call** (see below). This is
-   the "single-participant workflow" in action: the session is assembled
-   programmatically rather than pre-existing. Creating everything in one call
-   is also atomic — if a participant can't be added (e.g. no compatible proxy
-   number), the whole session creation fails and no half-built session is left
-   behind.
+5. **Create the session.** `/gather-action` creates a new Proxy Session, then
+   adds the two participants in **sequential** calls — **the caller first**
+   (see [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)).
+   The session is created with:
+   - `uniqueName` = `"<caller> -> <destination>"` (the actual numbers, e.g.
+     `+6590100209 -> +6590492680`), so sessions are identifiable in the console;
+   - `mode: 'voice-only'`;
+   - `ttl: 300` (5 minutes) so the session — and the proxy numbers it holds —
+     free themselves 5 minutes after the last interaction.
+
+   This is the "single-participant workflow" in action: the session is
+   assembled programmatically rather than pre-existing.
 
 6. **Redirect into Proxy.** Finally, `/gather-action` returns a `<Redirect>`
    pointing the *still-live* call at the Proxy Service's `Webhooks/Call`
@@ -162,19 +170,66 @@ sequenceDiagram
 
 ### Participant identities explained
 
-The session is created with both participants nested in the single
-`sessions.create({ mode: 'voice-only', participants: [...] })` call. The nested
-entries use the API's **PascalCase** field names (`Identifier` /
-`ProxyIdentifier`), not the camelCase used by the standalone participants
-endpoint. The two participants are what wire the call together:
+The two participants are what wire the call together:
 
 | Participant | `identifier` | `proxyIdentifier` | Meaning |
 |-------------|--------------|-------------------|---------|
-| **1 — the caller** | `From` (caller's real number) | `To` (the proxy number they dialed) | Binds the caller to the specific proxy number, so Proxy knows which number to present. |
-| **2 — the destination** | `realNumber` (resolved by `/lookup`) | *(none)* | Proxy picks a proxy number to reach the destination. |
+| **1 — the caller** | `From` (caller's real number) | `To` (the proxy number they dialed) | Binds the caller to the specific proxy number, so the redirect matches them back into this session. |
+| **2 — the destination** | `realNumber` (resolved by `/lookup`) | *(none — auto-assigned)* | Proxy picks a *free* proxy number to reach the destination. |
 
 Because Participant 1 pins `proxyIdentifier = To`, the caller stays on the
 exact number they originally dialed — the redirect feels seamless.
+
+### Why this can't be a single API call
+
+It's tempting to collapse the session + two participants into one call:
+
+```ts
+// ❌ Looks efficient, but breaks this flow:
+sessions.create({ mode: 'voice-only', participants: [
+  { Identifier: From, ProxyIdentifier: To },  // caller pins the dialed number
+  { Identifier: realNumber },                  // destination auto-assigns
+]});
+```
+
+The caller's `proxyIdentifier` **must** be `To` (the number they dialed) or the
+redirect in step 6 can't match them back into the session. The destination must
+get a **different** proxy number so the two legs are distinct.
+
+In a single atomic `create`, Proxy resolves the destination's auto-assigned
+number **without yet knowing the caller has claimed `To`** — so it hands the
+destination the *same* number. The result is a collision:
+
+```
+caller       From        -> To            (e.g. +6560443611)
+destination  realNumber   -> To            (e.g. +6560443611)  ← same number!
+```
+
+This was verified empirically against a live service (with a 2-number pool):
+both participants received the same proxy number regardless of the service's
+`numberSelectionBehavior` (`prefer-sticky` **and** `avoid-sticky`). When the
+caller and destination are in the same country (`geoMatchLevel = country`) and
+the number pool is small, the collision drops one participant — the caller ends
+up missing, Proxy treats the redirected call as out-of-session again, and the
+caller is re-prompted for the code in an endless loop.
+
+**The fix is ordering.** Creating the **caller first** actually reserves `To`,
+so when the destination is added next, that number is unavailable and Proxy is
+forced to pick a different free number:
+
+```
+caller       From        -> To            (+6560443611, reserved first)
+destination  realNumber   -> (auto)        (+6560356067, the remaining number)
+```
+
+Sequencing requires the caller's participant to exist *before* the destination
+is resolved, which a single call cannot express. Hence: **session create →
+add caller → add destination**, three sequential calls.
+
+> The only way to keep it to one call would be to pass the destination an
+> explicit `ProxyIdentifier` of a known-free number — but discovering a free
+> number means querying the pool first (another API call, and race-prone). So
+> the sequential approach is both simpler and more robust.
 
 ### The redirect trick
 
