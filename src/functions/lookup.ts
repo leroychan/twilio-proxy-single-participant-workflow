@@ -29,7 +29,8 @@ export const handler: ServerlessFunctionSignature = function (
   const realNumber = helpers.resolveRealNumber(
     context.LOOKUP_MAP,
     context.DEFAULT_REAL_NUMBER,
-    event.Digits
+    event.Digits,
+    event.From
   );
 
   const response = new Twilio.Response();

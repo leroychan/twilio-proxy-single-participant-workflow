@@ -86,11 +86,15 @@ export const handler: ServerlessFunctionSignature = async function (
     // number and does not require SMS capabilities (avoids error 80202).
     const client = context.getTwilioClient();
     const serviceSid = context.PROXY_SERVICE_SID as string;
-    // uniqueName: human-readable "<caller> -> <destination>" (actual numbers).
+    // uniqueName: human-readable "<caller> -> <destination>" plus an ISO
+    // timestamp. The timestamp is REQUIRED for uniqueness: a Proxy uniqueName
+    // is never released — not even after the session closes — so a static
+    // "<caller> -> <destination>" name lets that pair create exactly one
+    // session ever, and every later call fails with error 80603.
     // ttl: 300s (5 min) so the session — and the proxy numbers it holds — free
     // themselves 5 minutes after the last interaction.
     const session = await client.proxy.v1.services(serviceSid).sessions.create({
-      uniqueName: `${From} -> ${realNumber}`,
+      uniqueName: `${From} -> ${realNumber} @ ${new Date().toISOString()}`,
       mode: 'voice-only',
       ttl: 300,
     });

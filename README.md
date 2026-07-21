@@ -16,7 +16,7 @@ A caller dials a Proxy number that has no active session for them. Instead of fa
   - [Participant identities explained](#participant-identities-explained)
   - [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)
   - [The redirect trick](#the-redirect-trick)
-- [How the lookup should work (bidirectional)](#how-the-lookup-should-work-bidirectional)
+- [How the lookup works (bidirectional)](#how-the-lookup-works-bidirectional)
 - [Environment variables](#environment-variables)
 - [Setup](#setup)
 - [Run locally](#run-locally)
@@ -66,7 +66,7 @@ Everything runs on the Twilio Serverless (Functions) runtime. `/lookup` stands i
 | `/out-of-session` | POST | Proxy Service **Out-of-Session Callback URL** (Voice) | Entry point when a call hits a proxy number with no session. Returns a `<Gather>` for the code. |
 | `/gather-action` | POST | Target of the `<Gather action>` (set automatically) | Receives the DTMF digits, resolves the number, creates the session, and redirects the call into Proxy. |
 | `/lookup` | GET | Called internally by `/gather-action` | Mock REST API: maps a 6-digit code (+ caller number) to a destination number. |
-| `/callback` | POST | Proxy Service **Callback URL** | Receives Proxy session lifecycle events. Logs and returns `200`. |
+| `/callback` | POST | Proxy Service **Callback URL** | Receives Proxy session lifecycle events. **Validates the Twilio signature**, logs the event, and **closes the session** once the outbound leg reaches a terminal state (freeing the proxy number early). Returns `200`. |
 | `/intercept-callback` | POST | Proxy Service **Intercept Callback URL** | Receives Proxy intercept events. Logs and returns `200`. |
 
 ---
@@ -101,7 +101,7 @@ sequenceDiagram
     LK-->>GA: { "realNumber": "+65…" }
 
     Note over GA,Proxy: 2. Build the session (3 sequential calls — see note)
-    GA->>Proxy: Create Session (uniqueName "From -> realNumber", voice-only, ttl=300)
+    GA->>Proxy: Create Session (uniqueName "From -> realNumber @ timestamp", voice-only, ttl=300)
     GA->>Proxy: Add Participant 1 — caller (identifier=From, proxyIdentifier=To)
     GA->>Proxy: Add Participant 2 — destination (identifier=realNumber, auto proxy #)
 
@@ -149,8 +149,13 @@ sequenceDiagram
    adds the two participants in **sequential** calls — **the caller first**
    (see [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)).
    The session is created with:
-   - `uniqueName` = `"<caller> -> <destination>"` (the actual numbers, e.g.
-     `+6590100209 -> +6590492680`), so sessions are identifiable in the console;
+   - `uniqueName` = `"<caller> -> <destination> @ <ISO timestamp>"` (e.g.
+     `+6590100209 -> +6590492680 @ 2026-07-21T03:21:04.000Z`), so sessions are
+     identifiable in the console. The timestamp is required for uniqueness: a
+     Proxy `uniqueName` is **never released** (not even after the session
+     closes), so a static `"<caller> -> <destination>"` name would let that
+     pair create only one session ever and fail all later calls with error
+     `80603`;
    - `mode: 'voice-only'`;
    - `ttl: 300` (5 minutes) so the session — and the proxy numbers it holds —
      free themselves 5 minutes after the last interaction.
@@ -163,10 +168,22 @@ sequenceDiagram
    endpoint. Proxy takes over, dials the destination through the proxy number,
    and bridges the two parties. Neither side sees the other's real number.
 
-7. **Lifecycle events.** As the session progresses, Proxy posts events to
-   `/callback` and `/intercept-callback`. These handlers log the payload and
-   always return `200` with an empty JSON body — they never throw, so they
-   can't disrupt the session.
+7. **Lifecycle events & early cleanup.** As the session progresses, Proxy
+   posts events to `/callback` and `/intercept-callback`.
+   `/intercept-callback` just logs and returns `200` (allow). `/callback`:
+
+   - **Verifies the `X-Twilio-Signature`** on every request. Because it now
+     performs a destructive action (closing a session), the public URL must be
+     authenticated — a forged POST with a guessed session SID could otherwise
+     tear down a live call. Invalid/missing signature → `403`, no action.
+   - **Closes the session** as soon as the outbound (destination) leg reaches a
+     terminal state — `completed`, `busy`, `no-answer`, `failed`, or
+     `canceled`. Closing releases the held proxy number back to the pool
+     *immediately* instead of waiting out the TTL, which matters when the number
+     pool is small. The `ttl: 300` set at creation remains the backstop if a
+     callback is missed or the session was already closed.
+   - Always returns `200` after a successful signature check and never throws,
+     so cleanup failures (e.g. an already-closed session) can't disrupt Proxy.
 
 ### Participant identities explained
 
@@ -245,17 +262,17 @@ an out-of-session call into a proxied, connected call.
 
 ---
 
-## How the lookup should work (bidirectional)
+## How the lookup works (bidirectional)
 
 A code (an "order") connects **two parties** — for example a **buyer** and a
-**courier**. The workflow must connect them **regardless of who calls first**:
+**courier**. The workflow connects them **regardless of who calls first**:
 
-- Buyer dials the proxy number, enters the code → should reach the **courier**.
-- Courier dials the proxy number, enters the code → should reach the **buyer**.
+- Party A dials the proxy number, enters the code → reaches **party B**.
+- Party B dials the proxy number, enters the code → reaches **party A**.
 
-So `/lookup` must not map a code to a single fixed number. It must resolve the
-**other party** relative to whoever is calling. Two inputs make this possible,
-and `/gather-action` already sends both:
+So `/lookup` does not map a code to a single fixed number. It resolves the
+**other party** relative to whoever is calling, using the two inputs
+`/gather-action` sends:
 
 - `Digits` — the entered code, identifying the order (the pair of parties).
 - `From` — the caller's real number, identifying **which** party is calling.
@@ -270,55 +287,58 @@ flowchart TD
     A["/lookup?Digits=CODE&From=CALLER"] --> B{Find order by CODE}
     B -->|not found| D["fallback: DEFAULT_REAL_NUMBER"]
     B -->|found| C{Which party is CALLER?}
-    C -->|CALLER == buyer| E["return courier number"]
-    C -->|CALLER == courier| F["return buyer number"]
+    C -->|CALLER == party A| E["return party B's number"]
+    C -->|CALLER == party B| F["return party A's number"]
     C -->|CALLER matches neither| D
 ```
 
 | Caller (`From`) is… | Return (`realNumber`) |
 |---------------------|-----------------------|
-| the **buyer**       | the **courier**'s number |
-| the **courier**     | the **buyer**'s number   |
-| neither / unknown   | `DEFAULT_REAL_NUMBER` (or reject) |
+| **party A**         | **party B**'s number |
+| **party B**         | **party A**'s number |
+| neither / unknown   | `DEFAULT_REAL_NUMBER` |
 
 ### Data model
 
-Instead of `code → number`, store each order as a **pair** so either direction
-resolves. A production lookup would back this with a database keyed on the
-code; the mock can express it as JSON:
+Each code maps to a **two-element array** `["+partyA", "+partyB"]`. The order of
+the two numbers doesn't matter — resolution simply returns whichever one is not
+the caller:
 
 ```jsonc
+// LOOKUP_MAP
 {
-  "123456": { "buyer": "+6590492680", "courier": "+6581234567" },
-  "654321": { "buyer": "+6599990000", "courier": "+6588887777" }
+  "123456": ["+6590492680", "+6581234567"],
+  "654321": ["+6599990000", "+6588887777"]
 }
 ```
 
-Resolution pseudocode:
+This is implemented in `resolveRealNumber()` (`src/assets/helpers.private.ts`):
 
 ```ts
-const order = orders[digits];
-if (!order) return DEFAULT_REAL_NUMBER;          // unknown code
-if (from === order.buyer)   return order.courier; // buyer → courier
-if (from === order.courier) return order.buyer;   // courier → buyer
-return DEFAULT_REAL_NUMBER;                        // caller not part of order
+const entry = map[digits];
+if (Array.isArray(entry)) {              // bidirectional pair
+  const [a, b] = entry;
+  if (from === a) return b;              // party A → party B
+  if (from === b) return a;              // party B → party A
+  // caller is not part of this pair → fall through to default
+}
+return DEFAULT_REAL_NUMBER;
 ```
+
+> **Backward compatible:** a legacy string entry (`"code": "+number"`) is still
+> honoured — it returns that number regardless of the caller. Prefer the pair
+> array for new entries so the flow works in both directions.
 
 ### Why this is symmetric with Proxy
 
-The rest of the flow already works both ways without changes: `/gather-action`
-adds the caller (`From`) as Participant 1 and the resolved counterparty as
-Participant 2, then redirects into Proxy. Because the lookup returns the
-counterparty relative to the caller, the exact same code path connects
-buyer→courier and courier→buyer — only the `/lookup` resolution differs by
-direction.
+The rest of the flow works both ways without changes: `/gather-action` adds the
+caller (`From`) as Participant 1 and the resolved counterparty as Participant 2,
+then redirects into Proxy. Because the lookup returns the counterparty relative
+to the caller, the exact same code path connects A→B and B→A — only the
+`/lookup` resolution differs by direction.
 
-> **Current state:** the shipped `/lookup` (`resolveRealNumber`) is a
-> simplified **one-directional** mock — it maps `code → number` using
-> `LOOKUP_MAP` and ignores `From`. To support the buyer↔courier use case,
-> replace it with the pair-based, `From`-aware resolution above (and update
-> `LOOKUP_MAP` to the paired structure or point `/lookup` at your real
-> service).
+In production, replace the JSON map with a database/service lookup keyed on the
+code that applies the same "return the other party" rule.
 
 ---
 
@@ -329,10 +349,10 @@ Copy `.env.example` to `.env` and fill in real values. `.env` is gitignored.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ACCOUNT_SID` | Yes | Twilio Account SID. Also injected at runtime as `context.ACCOUNT_SID`. |
-| `AUTH_TOKEN` | For local dev | Account auth token. Needed by the local `twilio-run` dev server so `getTwilioClient()` can authenticate. On deployed Functions, Twilio injects credentials automatically. |
+| `AUTH_TOKEN` | Yes | Account auth token. Needed by the local `twilio-run` dev server so `getTwilioClient()` can authenticate, **and by `/callback` to validate the `X-Twilio-Signature`** (both locally and when deployed — set it as a Function environment variable on deploy). |
 | `PROXY_SERVICE_SID` | Yes | Proxy Service SID (`KS…`) used for session creation and the redirect URL. |
-| `LOOKUP_MAP` | Yes | JSON map of `"6-digit code": "+destinationNumber"`, e.g. `{"123456":"+6590492680"}`. |
-| `DEFAULT_REAL_NUMBER` | Yes | Fallback destination (E.164) when the entered code isn't in `LOOKUP_MAP`. |
+| `LOOKUP_MAP` | Yes | JSON map of `"6-digit code"` → **two-party pair** `["+partyA","+partyB"]`, e.g. `{"123456":["+6590492680","+6581234567"]}`. The caller (`From`) is matched against the pair and the *other* party is returned (bidirectional). A legacy string value (`"code":"+number"`) is still accepted. See [How the lookup works](#how-the-lookup-works-bidirectional). |
+| `DEFAULT_REAL_NUMBER` | Yes | Fallback destination (E.164) when the code is unknown or the caller isn't part of the pair. |
 | `SERVICE_BASE_URL` | Optional | Absolute base URL of this service. When empty, it's derived from `context.DOMAIN_NAME` (`https` for `*.twil.io`, `http` for `localhost`). Set this when fronting the dev server with a tunnel (e.g. `https://your.ngrok.io`). |
 
 ---

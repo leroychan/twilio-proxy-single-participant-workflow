@@ -50,9 +50,12 @@ it('looks up the number, creates a session with both participants, and redirects
       expect(fetchUrl).toContain('https://svc-1234-dev.twil.io/lookup');
 
       // session created voice-only (so Proxy doesn't require SMS-capable
-      // numbers), named "<caller> -> <destination>", with a 5-minute TTL.
+      // numbers), named "<caller> -> <destination> @ <timestamp>" (the
+      // timestamp keeps the uniqueName unique), with a 5-minute TTL.
       expect(sessionsCreate).toHaveBeenCalledWith({
-        uniqueName: '+15551112222 -> +15551230000',
+        uniqueName: expect.stringMatching(
+          /^\+15551112222 -> \+15551230000 @ /
+        ),
         mode: 'voice-only',
         ttl: 300,
       });
