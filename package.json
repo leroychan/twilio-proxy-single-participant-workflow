@@ -5,6 +5,7 @@
   "scripts": {
     "test": "jest",
     "typecheck": "tsc --noEmit",
+    "seed:lookup": "node --env-file=.env scripts/seed-lookup.js",
     "start": "twilio-run --functions-folder dist/functions --assets-folder dist/assets",
     "deploy": "twilio-run deploy --functions-folder dist/functions --assets-folder dist/assets",
     "build": "tsc && npm run build:copy-assets",

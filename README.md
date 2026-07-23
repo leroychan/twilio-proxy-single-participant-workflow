@@ -2,21 +2,24 @@
 
 Twilio Serverless (TypeScript) functions implementing a **Twilio Proxy out-of-session voice workflow**.
 
-A caller dials a Proxy number that has no active session for them. Instead of failing, the call is intercepted, the caller is prompted for a 6-digit code, the code is resolved to a real destination number, a Proxy Session is created on the fly, and the live call is redirected into that session — connecting the caller to the destination through the proxy number so neither party sees the other's real number.
+A caller dials a Proxy number that has no active session for them. Instead of failing, the call is intercepted, the caller is prompted for a 6-digit code, and the code is resolved to a real destination number. That number is stashed in **Twilio Sync** and the live call is redirected back into Proxy, which fires its Out-of-Session Callback a **second** time — this time answered with Proxy's **auto-create-session** JSON. Proxy stands up the session itself, binds the caller to the exact (reserved) number they dialed, and bridges them to the destination through the proxy number so neither party sees the other's real number.
 
 ---
 
 ## Table of contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
+  - [Entry point: the reserved Proxy number](#entry-point-the-reserved-proxy-number)
 - [Endpoints](#endpoints)
 - [The Flow (how it works)](#the-flow-how-it-works)
   - [Sequence diagram](#sequence-diagram)
   - [Step-by-step](#step-by-step)
-  - [Participant identities explained](#participant-identities-explained)
-  - [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)
+  - [Why Proxy auto-creates the session (not us)](#why-proxy-auto-creates-the-session-not-us)
+  - [Why the resolution travels through Twilio Sync](#why-the-resolution-travels-through-twilio-sync)
   - [The redirect trick](#the-redirect-trick)
+  - [Number masking (what each party sees)](#number-masking-what-each-party-sees)
 - [How the lookup works (bidirectional)](#how-the-lookup-works-bidirectional)
+- [Data stores & schema](#data-stores--schema)
 - [Environment variables](#environment-variables)
 - [Setup](#setup)
 - [Run locally](#run-locally)
@@ -33,6 +36,7 @@ flowchart LR
     Caller([📞 Caller])
     Proxy[[Twilio Proxy Service]]
     Dest([📱 Destination])
+    Sync[(Twilio Sync)]
 
     subgraph Functions["Serverless Functions"]
         OOS["/out-of-session"]
@@ -43,12 +47,15 @@ flowchart LR
     end
 
     Caller -->|dials proxy number| Proxy
-    Proxy -->|no active session| OOS
+    Proxy -->|no session → 1st bounce| OOS
     OOS -->|Gather TwiML| Caller
     Caller -->|DTMF digits| GA
     GA -->|resolve code| LK
-    GA -->|create session + participants| Proxy
+    GA -. "store CallSid → number" .-> Sync
     GA -->|Redirect TwiML| Proxy
+    Proxy -->|still no session → 2nd bounce| OOS
+    OOS -. "read CallSid → number" .-> Sync
+    OOS -->|auto-create session JSON| Proxy
     Proxy <-->|bridged call| Caller
     Proxy <-->|bridged call| Dest
     Proxy -. "lifecycle events (signed)" .-> CB
@@ -57,7 +64,24 @@ flowchart LR
     ICB -. "allow (200)" .-> Proxy
 ```
 
-Everything runs on the Twilio Serverless (Functions) runtime. `/lookup` stands in for a real number-resolution REST API — swap it for your own service in production.
+Everything runs on the Twilio Serverless (Functions) runtime. `/lookup` reads the order→parties data from a Twilio Sync Map — swap it for your own service in production (see [Data stores & schema](#data-stores--schema)).
+
+### Entry point: the reserved Proxy number
+
+The **front door** of the whole flow is a **reserved** phone number on the Proxy
+Service. The caller dials it, and — because there's no active session for them —
+Proxy fires its Out-of-Session Callback to `/out-of-session`.
+
+Why *reserved* matters: a reserved Proxy number is **never auto-assigned** to a
+participant. That's exactly what makes the auto-create step reliable — when
+Proxy creates the session from the auto-create JSON, it binds the caller to the
+very number they dialed (nothing else could have grabbed it), so the caller's
+live PSTN leg always matches the session. A non-reserved entry number could be
+handed to some other participant and the match would fail.
+
+Set the number's **Voice** configuration to the Proxy Service (or add it to the
+service's number pool as a reserved number) so inbound calls trigger the
+Out-of-Session Callback.
 
 ---
 
@@ -65,9 +89,9 @@ Everything runs on the Twilio Serverless (Functions) runtime. `/lookup` stands i
 
 | Route | Method | Configure as | Purpose |
 |-------|--------|--------------|---------|
-| `/out-of-session` | POST | Proxy Service **Out-of-Session Callback URL** (Voice) | Entry point when a call hits a proxy number with no session. Returns a `<Gather>` for the code. |
-| `/gather-action` | POST | Target of the `<Gather action>` (set automatically) | Receives the DTMF digits, resolves the number, creates the session, and redirects the call into Proxy. |
-| `/lookup` | GET | Called internally by `/gather-action` | Mock REST API: maps a 6-digit code (+ caller number) to a destination number. |
+| `/out-of-session` | POST | Proxy Service **Out-of-Session Callback URL** (Voice) | Entry point when a call hits a proxy number with no session. On the **1st** bounce (no stored resolution) returns a `<Gather>` for the code. On the **2nd** bounce (after `/gather-action` has stashed the resolution) returns Proxy's **auto-create-session JSON**, so Proxy builds the session, binds the caller to the dialed number, and bridges the call. |
+| `/gather-action` | POST | Target of the `<Gather action>` (set automatically) | Receives the DTMF digits, resolves the destination number, **stores it in Twilio Sync keyed by `CallSid`**, and redirects the call back into Proxy (which triggers the 2nd out-of-session bounce). It no longer creates the session itself. |
+| `/lookup` | GET | Called internally by `/gather-action` | Number-resolution API: reads the **Sync `lookup` Map** to map a 6-digit code (+ caller number) to the counterparty's destination number. |
 | `/callback` | POST | Proxy Service **Callback URL** | Receives Proxy session lifecycle events. **Validates the Twilio signature**, logs the event, and **closes the session** once the outbound leg reaches a terminal state (freeing the proxy number early). Returns `200`. |
 | `/intercept-callback` | POST | Proxy Service **Intercept Callback URL** | Receives Proxy intercept events. Logs and returns `200`. |
 
@@ -90,27 +114,35 @@ sequenceDiagram
     participant OOS as /out-of-session
     participant GA as /gather-action
     participant LK as /lookup
+    participant Sync as Twilio Sync
     participant CB as /callback
     actor Dest as Destination
 
     Caller->>Proxy: Dials proxy number (To), no active session
-    Proxy->>OOS: POST Out-of-Session Callback
+    Proxy->>OOS: POST Out-of-Session Callback (1st bounce)
+    OOS->>Sync: read resolution for CallSid
+    Sync-->>OOS: none yet
     OOS-->>Caller: <Gather numDigits=6> "Please enter your order number."
 
-    Caller->>GA: POST Digits, From, To (DTMF entered)
+    Caller->>GA: POST Digits, From, CallSid (DTMF entered)
 
     Note over GA,LK: 1. Resolve the destination number
     GA->>LK: GET /lookup?Digits=…&From=…
     LK-->>GA: { "realNumber": "+65…" }
 
-    Note over GA,Proxy: 2. Build the session (3 sequential calls — see note)
-    GA->>Proxy: Create Session (uniqueName "From -> realNumber @ timestamp", voice-only, ttl=300)
-    GA->>Proxy: Add Participant 1 — caller (identifier=From, proxyIdentifier=To)
-    GA->>Proxy: Add Participant 2 — destination (identifier=realNumber, auto proxy #)
+    Note over GA,Sync: 2. Stash the resolution (keyed by CallSid)
+    GA->>Sync: create document(uniqueName=res-<CallSid>, {realNumber}, ttl=900)
 
-    Note over GA,Proxy: 3. Hand the live call to Proxy
+    Note over GA,Proxy: 3. Hand the live call back to Proxy
     GA-->>Proxy: <Redirect> to Proxy Webhooks/Call URL
-    Proxy->>Dest: Dials destination via proxy number
+
+    Proxy->>OOS: POST Out-of-Session Callback (2nd bounce, still no session)
+    OOS->>Sync: read resolution for CallSid
+    Sync-->>OOS: { realNumber }
+    OOS->>Sync: delete document (best-effort; ttl backstops)
+    OOS-->>Proxy: JSON { uniqueName, ttl:300, mode:voice-only, participantIdentifier }
+    Proxy->>Proxy: Auto-create session; bind caller to dialed (reserved) number
+    Proxy->>Dest: Dials destination via a pool proxy number
     Caller<<->>Dest: Connected through Proxy
 
     Note over Proxy,CB: 4. Lifecycle events + early cleanup
@@ -144,40 +176,67 @@ sequenceDiagram
    ```
 
 3. **Digits arrive.** The caller keys in the code. Twilio posts `Digits`,
-   `From` (the caller's real number), and `To` (the proxy number they dialed)
-   to `/gather-action`. If any of these are missing, the handler says a short
-   apology and hangs up — it never creates a partial session.
+   `From` (the caller's real number), and `CallSid` (the call identifier, used
+   as the Sync key) to `/gather-action`. If any of these are missing, the
+   handler says a short apology and hangs up.
 
 4. **Resolve the destination.** `/gather-action` calls `/lookup` with the
-   digits and caller number. `/lookup` uses `resolveRealNumber()` to look the
-   code up in `LOOKUP_MAP`, falling back to `DEFAULT_REAL_NUMBER` when the
-   code is unknown or the map is malformed. It responds with
-   `{ "realNumber": "+65…" }`.
+   digits and caller number. `/lookup` reads the **Sync `lookup` Map** and uses
+   `resolveCounterparty()` to return the *other* party for that code, falling
+   back to `DEFAULT_REAL_NUMBER` when the code is unknown or the caller isn't in
+   the pair. It responds with `{ "realNumber": "+E164" }`.
 
-5. **Create the session.** `/gather-action` creates a new Proxy Session, then
-   adds the two participants in **sequential** calls — **the caller first**
-   (see [Why this can't be a single API call](#why-this-cant-be-a-single-api-call)).
-   The session is created with:
-   - `uniqueName` = `"<caller> -> <destination> @ <ISO timestamp>"` (e.g.
-     `+6590100209 -> +6590492680 @ 2026-07-21T03:21:04.000Z`), so sessions are
-     identifiable in the console. The timestamp is required for uniqueness: a
-     Proxy `uniqueName` is **never released** (not even after the session
-     closes), so a static `"<caller> -> <destination>"` name would let that
-     pair create only one session ever and fail all later calls with error
-     `80603`;
-   - `mode: 'voice-only'`;
-   - `ttl: 300` (5 minutes) so the session — and the proxy numbers it holds —
-     free themselves 5 minutes after the last interaction.
+5. **Stash the resolution.** `/gather-action` does **not** create the session.
+   It writes a **Twilio Sync Document** (`uniqueName = res-<CallSid>`, `data =
+   { realNumber }`, `ttl: 900`) so the resolved number survives until Proxy
+   asks for it again. This is necessary because the Out-of-Session Callback
+   payload never contains the entered `Digits` — only the second bounce can
+   turn the resolution into a session, and it needs somewhere to read the
+   number from. `CallSid` is the join key because it's stable across the 1st
+   bounce, `/gather-action`, and the 2nd bounce. It's prefixed with `res-`
+   because Sync **rejects a `uniqueName` that matches the Twilio SID pattern**
+   (`[A-Z]{2}[a-f0-9]{32}`) — a raw `CallSid` (`CA…`) matches it and errors with
+   `54302 Invalid unique name`, so `save`/`get`/`delete` all key through the
+   same `res-<CallSid>` helper.
 
-   This is the "single-participant workflow" in action: the session is
-   assembled programmatically rather than pre-existing.
-
-6. **Redirect into Proxy.** Finally, `/gather-action` returns a `<Redirect>`
+6. **Redirect back into Proxy.** `/gather-action` returns a `<Redirect>`
    pointing the *still-live* call at the Proxy Service's `Webhooks/Call`
-   endpoint. Proxy takes over, dials the destination through the proxy number,
-   and bridges the two parties. Neither side sees the other's real number.
+   endpoint. Because no session matches yet, Proxy fires its Out-of-Session
+   Callback **again** — the second bounce.
 
-7. **Lifecycle events & early cleanup.** As the session progresses, Proxy
+7. **Auto-create on the second bounce.** This time `/out-of-session` finds a
+   stored resolution for the `CallSid`, so instead of a `<Gather>` it returns
+   Proxy's **auto-create-session JSON**:
+
+   ```json
+   {
+     "uniqueName": "<caller> -> <destination> @ <ISO timestamp>",
+     "ttl": 300,
+     "mode": "voice-only",
+     "participantIdentifier": "<destination>"
+   }
+   ```
+
+   Proxy then creates the session itself, **automatically adds the caller as a
+   participant bound to the exact number they dialed** (the reserved `To`),
+   adds `participantIdentifier` as the destination on a free pool number, and
+   bridges the two parties. The stored Sync Document is deleted (best-effort;
+   its TTL is the backstop). Neither side sees the other's real number.
+   - `uniqueName` carries an ISO timestamp because a Proxy `uniqueName` is
+     **never released** (not even after the session closes); a static name
+     would let a pair create only one session ever and fail later calls with
+     error `80603`.
+   - `ttl: 300` (5 minutes) frees the session — and the proxy numbers it holds
+     — five minutes after the last interaction.
+   - The response must be a genuine **JSON object with
+     `Content-Type: application/json`** (the 1st bounce, by contrast, is TwiML
+     with `application/xml`). Do **not** hand the runtime a pre-stringified
+     body: `response.setBody(JSON.stringify(obj))` double-encodes it into a
+     quoted string (`"{\"uniqueName\":…}"`), so Proxy parses it as TwiML and
+     fails with error `12100` ("Content is not allowed in prolog") — the call
+     never connects. Pass the object itself and let the runtime serialize once.
+
+8. **Lifecycle events & early cleanup.** As the session progresses, Proxy
    posts events to `/callback` and `/intercept-callback`.
    `/intercept-callback` just logs and returns `200` (allow). `/callback`:
 
@@ -194,68 +253,60 @@ sequenceDiagram
    - Always returns `200` after a successful signature check and never throws,
      so cleanup failures (e.g. an already-closed session) can't disrupt Proxy.
 
-### Participant identities explained
+### Why Proxy auto-creates the session (not us)
 
-The two participants are what wire the call together:
+The caller dials a **reserved** proxy number. A reserved number is never
+auto-assigned to a participant — Proxy will only put a participant on it if you
+name it explicitly. That's exactly the binding we need: the caller's live PSTN
+leg is physically on the number they dialed, so the caller's participant *must*
+sit on that same number, or the redirect can't match them back into a session.
 
-| Participant | `identifier` | `proxyIdentifier` | Meaning |
-|-------------|--------------|-------------------|---------|
-| **1 — the caller** | `From` (caller's real number) | `To` (the proxy number they dialed) | Binds the caller to the specific proxy number, so the redirect matches them back into this session. |
-| **2 — the destination** | `realNumber` (resolved by `/lookup`) | *(none — auto-assigned)* | Proxy picks a *free* proxy number to reach the destination. |
+Letting `/gather-action` create the session itself makes this fragile: adding
+the caller without a `proxyIdentifier` lets Proxy auto-assign a *different* pool
+number than the one they dialed, and the redirect then fails to match — the
+call falls back to out-of-session and loops. (Observed live: the caller was
+auto-assigned a pool number other than the reserved one they dialed, so every
+redirect bounced straight back to `/out-of-session`.)
 
-Because Participant 1 pins `proxyIdentifier = To`, the caller stays on the
-exact number they originally dialed — the redirect feels seamless.
+Proxy's **auto-create-session** response sidesteps all of this. When
+`/out-of-session` answers a bounce with the JSON below, Proxy creates the
+session **and binds the caller to the exact number they dialed for you** — no
+manual participant wiring, no chance of the caller landing on the wrong number:
 
-### Why this can't be a single API call
-
-It's tempting to collapse the session + two participants into one call:
-
-```ts
-// ❌ Looks efficient, but breaks this flow:
-sessions.create({ mode: 'voice-only', participants: [
-  { Identifier: From, ProxyIdentifier: To },  // caller pins the dialed number
-  { Identifier: realNumber },                  // destination auto-assigns
-]});
+```json
+{
+  "uniqueName": "<caller> -> <destination> @ <ISO timestamp>",
+  "ttl": 300,
+  "mode": "voice-only",
+  "participantIdentifier": "<destination>"
+}
 ```
 
-The caller's `proxyIdentifier` **must** be `To` (the number they dialed) or the
-redirect in step 6 can't match them back into the session. The destination must
-get a **different** proxy number so the two legs are distinct.
+You only specify the *other* party (`participantIdentifier`); Proxy owns the
+caller side.
 
-In a single atomic `create`, Proxy resolves the destination's auto-assigned
-number **without yet knowing the caller has claimed `To`** — so it hands the
-destination the *same* number. The result is a collision:
+### Why the resolution travels through Twilio Sync
 
-```
-caller       From        -> To            (e.g. +6560443611)
-destination  realNumber   -> To            (e.g. +6560443611)  ← same number!
-```
-
-This was verified empirically against a live service (with a 2-number pool):
-both participants received the same proxy number regardless of the service's
-`numberSelectionBehavior` (`prefer-sticky` **and** `avoid-sticky`). When the
-caller and destination are in the same country (`geoMatchLevel = country`) and
-the number pool is small, the collision drops one participant — the caller ends
-up missing, Proxy treats the redirected call as out-of-session again, and the
-caller is re-prompted for the code in an endless loop.
-
-**The fix is ordering.** Creating the **caller first** actually reserves `To`,
-so when the destination is added next, that number is unavailable and Proxy is
-forced to pick a different free number:
+The catch: that JSON needs `participantIdentifier` (the resolved destination),
+but the Out-of-Session Callback payload only ever contains `From`, `To`, and
+`CallSid` — **never the entered `Digits`**. Only `/gather-action` sees the
+digits and can resolve the number. So the resolution has to be handed to the
+*second* out-of-session bounce out-of-band:
 
 ```
-caller       From        -> To            (+6560443611, reserved first)
-destination  realNumber   -> (auto)        (+6560356067, the remaining number)
+1st bounce   /out-of-session   Sync has nothing for CallSid   → <Gather>
+             /gather-action    resolve digits → Sync.write(CallSid → number)
+2nd bounce   /out-of-session   Sync has number for CallSid     → auto-create JSON
 ```
 
-Sequencing requires the caller's participant to exist *before* the destination
-is resolved, which a single call cannot express. Hence: **session create →
-add caller → add destination**, three sequential calls.
-
-> The only way to keep it to one call would be to pass the destination an
-> explicit `ProxyIdentifier` of a known-free number — but discovering a free
-> number means querying the pool first (another API call, and race-prone). So
-> the sequential approach is both simpler and more robust.
+`CallSid` is the join key because it stays identical across the 1st bounce,
+`/gather-action`, and the 2nd bounce. We use a **Twilio Sync Document** per call
+(`uniqueName = res-<CallSid>`, `ttl: 900`) — it's a managed, strongly-consistent
+store that works both locally and when deployed. (A file-based store like
+`lowdb` would work on the local dev server but not on deployed Twilio Functions,
+whose filesystem isn't shared or writable across invocations.) The `res-` prefix
+is required because Sync rejects a SID-shaped `uniqueName` and a raw `CallSid`
+matches that pattern.
 
 ### The redirect trick
 
@@ -265,9 +316,38 @@ The redirect URL is constructed from account/service context:
 https://webhooks.twilio.com/v1/Accounts/{ACCOUNT_SID}/Proxy/{PROXY_SERVICE_SID}/Webhooks/Call
 ```
 
-Redirecting the live call to this URL is what moves an ordinary inbound PSTN
-call *into* the freshly created Proxy Session. That's the mechanism that turns
-an out-of-session call into a proxied, connected call.
+Redirecting the live call to this URL hands the still-live PSTN call back to
+Proxy. Since no session matches it yet, Proxy fires the Out-of-Session Callback
+a second time — and *that* bounce (now armed with the Sync resolution) returns
+the auto-create JSON that stands up the session and connects the call.
+
+### Number masking (what each party sees)
+
+Once bridged, **each party sees the *other* party's proxy number as the caller
+ID — never the other's real number, and never their own proxy number.** Twilio
+assigns each participant one proxy number from the pool; per the
+[Proxy Participant docs](https://www.twilio.com/docs/proxy/api/participant), a
+participant's `proxy_identifier` is:
+
+> "The phone number or short code (masked number) of the participant's partner.
+> The participant will call or message the partner participant at this number."
+
+So masking is symmetric and stable. If the caller dialed in on pool number `P1`
+and the destination is reached on `P2`:
+
+| Party | Sees as caller ID | Can call back on | To reach |
+|-------|-------------------|------------------|----------|
+| Caller | `P2` (destination's proxy #) | `P2` | the destination |
+| Destination | `P1` (caller's proxy #) | `P1` | the caller |
+
+Either party can dial the masked number back later and be reconnected through
+the same pairing.
+
+> **Gotcha:** the Out-of-Session Callback payload's
+> `outboundParticipantProxyIdentifier` is the number assigned to *represent*
+> that participant to the other side (the inverse perspective), so it will
+> **not** match the caller ID that participant actually sees. Trust the outbound
+> call record's `from` field for the real displayed caller ID.
 
 ---
 
@@ -309,45 +389,100 @@ flowchart TD
 
 ### Data model
 
-Each code maps to a **two-element array** `["+partyA", "+partyB"]`. The order of
-the two numbers doesn't matter — resolution simply returns whichever one is not
-the caller:
+The mapping lives in the **Twilio Sync `lookup` Map** (see
+[Data stores & schema](#data-stores--schema)), one item per code:
 
 ```jsonc
-// LOOKUP_MAP
-{
-  "123456": ["+6590492680", "+6581234567"],
-  "654321": ["+6599990000", "+6588887777"]
-}
+// Sync Map "lookup" — item key = the 6-digit code
+"123456" -> { "parties": ["+partyA", "+partyB"] }   // bidirectional pair
+"654321" -> { "number":  "+dest" }                  // legacy one-directional
 ```
 
-This is implemented in `resolveRealNumber()` (`src/assets/helpers.private.ts`):
+The order of the two numbers in a pair doesn't matter — resolution returns
+whichever one is *not* the caller. This is implemented by
+`resolveCounterparty()` (`src/assets/helpers.private.ts`):
 
 ```ts
-const entry = map[digits];
-if (Array.isArray(entry)) {              // bidirectional pair
-  const [a, b] = entry;
-  if (from === a) return b;              // party A → party B
-  if (from === b) return a;              // party B → party A
-  // caller is not part of this pair → fall through to default
-}
+// entry = the Sync Map item's data
+const [a, b] = entry.parties;            // bidirectional pair
+if (from === a) return b;                // party A → party B
+if (from === b) return a;                // party B → party A
+// caller not in the pair (or code not found) → fall through to default
 return DEFAULT_REAL_NUMBER;
 ```
 
-> **Backward compatible:** a legacy string entry (`"code": "+number"`) is still
-> honoured — it returns that number regardless of the caller. Prefer the pair
-> array for new entries so the flow works in both directions.
+**Seeding:** the demo data lives in the `LOOKUP_MAP` env var; `npm run
+seed:lookup` (`scripts/seed-lookup.js`) reads it and upserts each entry into the
+Sync Map. `/lookup` never reads `LOOKUP_MAP` at runtime — only the Sync Map.
+
+> **Backward compatible:** a legacy `{ "number": "+dest" }` item is still
+> honoured — it returns that number regardless of the caller. Prefer the
+> `parties` pair for new entries so the flow works in both directions.
 
 ### Why this is symmetric with Proxy
 
-The rest of the flow works both ways without changes: `/gather-action` adds the
-caller (`From`) as Participant 1 and the resolved counterparty as Participant 2,
-then redirects into Proxy. Because the lookup returns the counterparty relative
-to the caller, the exact same code path connects A→B and B→A — only the
-`/lookup` resolution differs by direction.
+The rest of the flow works both ways without changes: `/gather-action` stashes
+the resolved counterparty as `participantIdentifier`, and Proxy auto-creates the
+session with the caller (`From`) bound to the dialed number. Because the lookup
+returns the counterparty relative to the caller, the exact same code path
+connects A→B and B→A — only the `/lookup` resolution differs by direction.
 
-In production, replace the JSON map with a database/service lookup keyed on the
-code that applies the same "return the other party" rule.
+In production, the Sync `lookup` Map can be replaced by any database/service
+keyed on the code that applies the same "return the other party" rule (see
+[Data stores & schema](#data-stores--schema)).
+
+---
+
+## Data stores & schema
+
+The workflow keeps **all** its state in **Twilio Sync** — two structures in one
+Sync Service (`SYNC_SERVICE_SID`):
+
+| Purpose | Sync resource | Key | Data schema | Lifetime |
+|---------|---------------|-----|-------------|----------|
+| Per-call handoff of the resolved number from `/gather-action` to the 2nd `/out-of-session` bounce | **Document** | `uniqueName = res-<CallSid>` | `{ "realNumber": "+E164" }` | `ttl: 900s` (auto-expires) |
+| Order → parties lookup data (read by `/lookup`) | **Map** `lookup` | item key = 6-digit code | `{ "parties": ["+E164A", "+E164B"] }` or legacy `{ "number": "+E164" }` | permanent (managed data) |
+
+> The resolution Document is keyed by `res-<CallSid>`, not the raw `CallSid`:
+> Sync rejects a `uniqueName` that matches the Twilio SID pattern
+> (`[A-Z]{2}[a-f0-9]{32}`), which a `CallSid` does. The `res-` prefix is applied
+> in one helper (`resolutionKey()`) shared by `save`/`get`/`delete`.
+
+### Twilio Sync is swappable for any database
+
+Sync is just a managed key-value store here — nothing in the design depends on
+it. To swap in Redis, DynamoDB, Postgres, or anything else, reimplement the four
+helper functions in `src/assets/helpers.private.ts` against your store, keeping
+the **same schema** above:
+
+- `saveResolution(callSid, realNumber)` — write `CallSid → { realNumber }` with a TTL.
+- `getResolution(callSid)` — read it back (return `null` if absent/expired).
+- `deleteResolution(callSid)` — best-effort delete (TTL is the real backstop).
+- `getLookupEntry(digits)` — read the `lookup` collection by code, returning
+  `{ parties }` / `{ number }` (or `null`).
+
+The resolution store needs **TTL + get/put/delete by key**; the lookup store
+needs a **keyed collection**. Any datastore offering those works.
+
+### Twilio Functions is swappable for your own stack
+
+The five handlers in `src/functions/` are plain
+request → (TwiML | JSON) logic — Twilio Functions is only the **host**. You can
+run the exact same logic on Express, AWS Lambda, Cloud Run, etc., as long as the
+endpoints Proxy (and the `<Gather>`) call keep the same contract:
+
+| Endpoint | Consumes | Returns |
+|----------|----------|---------|
+| `/out-of-session` | Proxy Out-of-Session Callback (`From`, `To`, `CallSid`, …) | `<Gather>` TwiML **or** auto-create JSON |
+| `/gather-action` | `<Gather>` POST (`Digits`, `From`, `CallSid`) | `<Redirect>` TwiML |
+| `/lookup` | `Digits`, `From` | `{ "realNumber": "+E164" }` |
+| `/callback` | Proxy lifecycle event (signed) | `200` |
+| `/intercept-callback` | Proxy intercept event | `200` |
+
+Off Twilio Functions you'd replace the runtime bits (`Twilio.Response`,
+`Runtime.getAssets()`, `context.getTwilioClient()`) with your framework's
+equivalents and a standard Twilio SDK client, and provide `X-Twilio-Signature`
+validation on `/callback` yourself.
 
 ---
 
@@ -359,8 +494,9 @@ Copy `.env.example` to `.env` and fill in real values. `.env` is gitignored.
 |----------|----------|-------------|
 | `ACCOUNT_SID` | Yes | Twilio Account SID. Also injected at runtime as `context.ACCOUNT_SID`. |
 | `AUTH_TOKEN` | Yes | Account auth token. Needed by the local `twilio-run` dev server so `getTwilioClient()` can authenticate, **and by `/callback` to validate the `X-Twilio-Signature`** (both locally and when deployed — set it as a Function environment variable on deploy). |
-| `PROXY_SERVICE_SID` | Yes | Proxy Service SID (`KS…`) used for session creation and the redirect URL. |
-| `LOOKUP_MAP` | Yes | JSON map of `"6-digit code"` → **two-party pair** `["+partyA","+partyB"]`, e.g. `{"123456":["+6590492680","+6581234567"]}`. The caller (`From`) is matched against the pair and the *other* party is returned (bidirectional). A legacy string value (`"code":"+number"`) is still accepted. See [How the lookup works](#how-the-lookup-works-bidirectional). |
+| `PROXY_SERVICE_SID` | Yes | Proxy Service SID (`KS…`) used to build the redirect URL. Proxy itself creates the session (via the auto-create response), so this is only for the `Webhooks/Call` redirect. |
+| `SYNC_SERVICE_SID` | Optional | Twilio Sync Service SID (`IS…`) backing the `CallSid → destination` handoff between `/gather-action` and the 2nd `/out-of-session` bounce. When empty, the account's **default** Sync service (alias `"default"`) is used, so no setup is needed. |
+| `LOOKUP_MAP` | Seed only | **Seed data**, not read at runtime. JSON map of `"6-digit code"` → **two-party pair** `["+partyA","+partyB"]`, e.g. `{"123456":["+15551112222","+15551230000"]}`. `npm run seed:lookup` loads it into the Sync `lookup` Map, which is what `/lookup` actually reads. A legacy string value (`"code":"+number"`) is also supported. See [How the lookup works](#how-the-lookup-works-bidirectional). |
 | `DEFAULT_REAL_NUMBER` | Yes | Fallback destination (E.164) when the code is unknown or the caller isn't part of the pair. |
 | `SERVICE_BASE_URL` | Optional | Absolute base URL of this service. When empty, it's derived from `context.DOMAIN_NAME` (`https` for `*.twil.io`, `http` for `localhost`). Set this when fronting the dev server with a tunnel (e.g. `https://your.ngrok.io`). |
 
@@ -371,7 +507,12 @@ Copy `.env.example` to `.env` and fill in real values. `.env` is gitignored.
 ```bash
 npm install
 cp .env.example .env   # then fill in real values
+npm run seed:lookup    # load LOOKUP_MAP into the Sync `lookup` Map
 ```
+
+`npm run seed:lookup` reads `LOOKUP_MAP` from `.env` and upserts each code into
+the Sync Map that `/lookup` reads. Re-run it whenever the seed data changes;
+it's idempotent.
 
 If you use the Twilio CLI, select the target account before deploying:
 
@@ -427,13 +568,15 @@ runtime.
 ```
 src/
   functions/
-    out-of-session.ts     # entry point: Gather for the 6-digit code
-    gather-action.ts      # resolve number, create session, redirect into Proxy
-    lookup.ts             # mock number-lookup REST API
-    callback.ts           # Proxy lifecycle events (log + 200)
+    out-of-session.ts     # 1st bounce: Gather for the code; 2nd bounce: auto-create JSON
+    gather-action.ts      # resolve number, stash in Sync (by CallSid), redirect into Proxy
+    lookup.ts             # number-lookup: reads the Sync `lookup` Map
+    callback.ts           # Proxy lifecycle events (validate signature, close session, 200)
     intercept-callback.ts # Proxy intercept events (log + 200)
   assets/
-    helpers.private.ts    # getBaseUrl(), resolveRealNumber() (runtime: /helpers.js)
+    helpers.private.ts    # getBaseUrl(), resolveCounterparty(), Sync store + lookup helpers (runtime: /helpers.js)
+scripts/
+  seed-lookup.js          # seed the Sync `lookup` Map from LOOKUP_MAP (npm run seed:lookup)
 tests/                    # jest unit tests, one per function + helpers
 ```
 

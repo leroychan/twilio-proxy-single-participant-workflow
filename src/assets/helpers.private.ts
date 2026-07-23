@@ -1,3 +1,116 @@
+/**
+ * Shape of the Twilio client's Sync Documents API that our helpers use.
+ * `documents` is both callable (`documents(key)` → a document instance) and
+ * has a `.create()` method, matching the Twilio SDK.
+ */
+type SyncClient = {
+  sync: {
+    v1: {
+      services: (serviceSid: string) => {
+        documents: ((key: string) => {
+          fetch: () => Promise<{ data?: Record<string, unknown> }>;
+          remove: () => Promise<unknown>;
+        }) & {
+          create: (opts: {
+            uniqueName: string;
+            data: Record<string, unknown>;
+            ttl?: number;
+          }) => Promise<unknown>;
+        };
+        syncMaps: (mapName: string) => {
+          syncMapItems: (key: string) => {
+            fetch: () => Promise<{ data?: Record<string, unknown> }>;
+          };
+        };
+      };
+    };
+  };
+};
+
+// Name of the Sync Map holding the order → parties lookup data. Keep this in
+// sync with scripts/seed-lookup.js, which populates the same Map.
+export const LOOKUP_SYNC_MAP_NAME = 'lookup';
+
+// How long a resolution is kept in Sync before it auto-expires. Comfortably
+// longer than the redirect round-trip that triggers the 2nd out-of-session
+// bounce; the TTL is a self-cleaning backstop if that bounce never happens.
+export const RESOLUTION_TTL_SECONDS = 900;
+
+// Build the Sync Document uniqueName for a call's resolution. Sync rejects a
+// uniqueName that matches the Twilio SID pattern (`[A-Z]{2}[a-f0-9]{32}`), and
+// a raw CallSid ("CA" + 32 hex) matches it — so prefix it to make a valid,
+// still-unique key. Keep save/get/delete going through this one function.
+export function resolutionKey(callSid: string): string {
+  return `res-${callSid}`;
+}
+
+/**
+ * Persist the destination number resolved in `/gather-action` so the *next*
+ * `/out-of-session` bounce can read it. The out-of-session callback payload
+ * never carries the entered digits, so the resolution has to be stashed
+ * out-of-band, keyed by `CallSid` (stable across the redirect).
+ *
+ * Stored as a Sync Document (uniqueName = CallSid) so it is self-contained and
+ * addressable by name with no parent container to create first.
+ */
+export async function saveResolution(
+  client: SyncClient,
+  syncServiceSid: string,
+  callSid: string,
+  realNumber: string
+): Promise<void> {
+  await client.sync.v1.services(syncServiceSid).documents.create({
+    uniqueName: resolutionKey(callSid),
+    data: { realNumber },
+    ttl: RESOLUTION_TTL_SECONDS,
+  });
+}
+
+/**
+ * Read the destination number stashed by `saveResolution` for this `CallSid`.
+ * Returns `null` when there is no resolution yet (e.g. the 1st out-of-session
+ * bounce, before the caller has entered a code) — the Sync fetch 404s on a
+ * missing document, which we treat as "not resolved".
+ */
+export async function getResolution(
+  client: SyncClient,
+  syncServiceSid: string,
+  callSid: string
+): Promise<string | null> {
+  try {
+    const doc = await client.sync.v1
+      .services(syncServiceSid)
+      .documents(resolutionKey(callSid))
+      .fetch();
+    const realNumber = doc.data && doc.data.realNumber;
+    return typeof realNumber === 'string' && realNumber.length > 0
+      ? realNumber
+      : null;
+  } catch {
+    // Missing document (404) or any transient read error → treat as unresolved.
+    return null;
+  }
+}
+
+/**
+ * Best-effort delete of the resolution once it has been consumed. Failures are
+ * swallowed because the Document's TTL is the real cleanup guarantee.
+ */
+export async function deleteResolution(
+  client: SyncClient,
+  syncServiceSid: string,
+  callSid: string
+): Promise<void> {
+  try {
+    await client.sync.v1
+      .services(syncServiceSid)
+      .documents(resolutionKey(callSid))
+      .remove();
+  } catch {
+    // already gone / expired — nothing to do.
+  }
+}
+
 export function getBaseUrl(context: {
   DOMAIN_NAME?: string;
   SERVICE_BASE_URL?: string;
@@ -12,47 +125,76 @@ export function getBaseUrl(context: {
 }
 
 /**
- * Resolve the destination ("other party") number for a call.
+ * Read the lookup entry for a 6-digit code from the Sync `lookup` Map. Returns
+ * the Map item's `data` (see `resolveCounterparty` for the accepted shapes), or
+ * `null` when the code isn't in the Map (Sync 404s) or the read fails.
+ */
+export async function getLookupEntry(
+  client: SyncClient,
+  syncServiceSid: string,
+  mapName: string,
+  digits: string | undefined
+): Promise<unknown | null> {
+  if (!digits) return null;
+  try {
+    const item = await client.sync.v1
+      .services(syncServiceSid)
+      .syncMaps(mapName)
+      .syncMapItems(digits)
+      .fetch();
+    return item.data ?? null;
+  } catch {
+    // missing code (404) or transient read error → treat as no match.
+    return null;
+  }
+}
+
+/**
+ * Resolve the destination ("other party") number from a lookup entry.
  *
- * LOOKUP_MAP entries may be either format:
- *   - Bidirectional pair (preferred): `"code": ["+partyA", "+partyB"]`.
+ * `entry` is a Sync Map item's `data` (or any parsed lookup value) in one of:
+ *   - Bidirectional pair (preferred): `{ parties: ["+partyA", "+partyB"] }`.
  *     One code links two parties. The `from` (caller) is matched against the
  *     pair and the OTHER party's number is returned, so the same code connects
- *     A→B and B→A. If the caller is neither party, we fall back to the default.
- *   - One-directional (legacy): `"code": "+number"`. Returns the number
+ *     A→B and B→A. If the caller is neither party, fall back to the default.
+ *   - One-directional (legacy): `{ number: "+dest" }`. Returns the number
  *     regardless of caller.
+ *   - Defensive: a bare array `["+a","+b"]` or bare string `"+dest"` are also
+ *     accepted.
  *
- * Falls back to `defaultNumber` when the code is unknown, the caller is not in
- * the pair, or the JSON is malformed.
+ * Falls back to `defaultNumber` when the entry is missing/unusable or the
+ * caller is not part of the pair.
  */
-export function resolveRealNumber(
-  lookupMapJson: string | undefined,
-  defaultNumber: string | undefined,
-  digits: string | undefined,
-  from: string | undefined
+export function resolveCounterparty(
+  entry: unknown,
+  from: string | undefined,
+  defaultNumber: string | undefined
 ): string {
-  if (digits && lookupMapJson) {
-    try {
-      const map = JSON.parse(lookupMapJson) as Record<string, unknown>;
-      const entry = map[digits];
+  const isNonEmpty = (n: unknown): n is string =>
+    typeof n === 'string' && n.length > 0;
 
-      // Bidirectional pair: return whichever party is not the caller.
-      if (Array.isArray(entry)) {
-        const parties = entry.filter(
-          (n): n is string => typeof n === 'string' && n.length > 0
-        );
-        if (parties.length === 2 && from) {
-          if (from === parties[0]) return parties[1];
-          if (from === parties[1]) return parties[0];
-        }
-        // caller is not part of this pair → fall through to default
-      } else if (typeof entry === 'string' && entry.length > 0) {
-        // Legacy one-directional mapping.
-        return entry;
-      }
-    } catch {
-      // fall through to default
+  let parties: string[] | null = null;
+  let single: string | null = null;
+
+  if (Array.isArray(entry)) {
+    parties = entry.filter(isNonEmpty);
+  } else if (entry && typeof entry === 'object') {
+    const e = entry as Record<string, unknown>;
+    if (Array.isArray(e.parties)) {
+      parties = e.parties.filter(isNonEmpty);
+    } else if (isNonEmpty(e.number)) {
+      single = e.number;
     }
+  } else if (isNonEmpty(entry)) {
+    single = entry;
+  }
+
+  if (parties && parties.length === 2 && from) {
+    if (from === parties[0]) return parties[1];
+    if (from === parties[1]) return parties[0];
+    // caller is not part of this pair → fall through to default
+  } else if (single) {
+    return single;
   }
   return defaultNumber ?? '';
 }

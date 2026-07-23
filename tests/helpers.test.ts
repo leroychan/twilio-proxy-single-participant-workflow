@@ -1,4 +1,7 @@
-import { getBaseUrl, resolveRealNumber } from '../src/assets/helpers.private';
+import {
+  getBaseUrl,
+  resolveCounterparty,
+} from '../src/assets/helpers.private';
 
 describe('getBaseUrl', () => {
   it('uses SERVICE_BASE_URL when set, stripping a trailing slash', () => {
@@ -20,49 +23,53 @@ describe('getBaseUrl', () => {
   });
 });
 
-describe('resolveRealNumber', () => {
-  // Bidirectional pair format: one code links two parties.
-  const pairMap = '{"123456":["+15551110000","+15552220000"]}';
-  // Legacy one-directional format: code -> number.
-  const legacyMap = '{"654321":"+15559990000"}';
+describe('resolveCounterparty', () => {
+  // Sync Map item data: bidirectional pair.
+  const pair = { parties: ['+15551110000', '+15552220000'] };
+  // Legacy one-directional item data.
+  const legacy = { number: '+15559990000' };
 
   it('returns party B when party A is the caller', () => {
-    expect(resolveRealNumber(pairMap, '+15550000000', '123456', '+15551110000')).toBe(
+    expect(resolveCounterparty(pair, '+15551110000', '+15550000000')).toBe(
       '+15552220000'
     );
   });
 
   it('returns party A when party B is the caller (other direction)', () => {
-    expect(resolveRealNumber(pairMap, '+15550000000', '123456', '+15552220000')).toBe(
+    expect(resolveCounterparty(pair, '+15552220000', '+15550000000')).toBe(
       '+15551110000'
     );
   });
 
   it('falls back to the default when the caller is in neither party of the pair', () => {
-    expect(resolveRealNumber(pairMap, '+15550000000', '123456', '+15559998888')).toBe(
+    expect(resolveCounterparty(pair, '+15559998888', '+15550000000')).toBe(
       '+15550000000'
     );
   });
 
-  it('still supports the legacy one-directional format', () => {
-    expect(resolveRealNumber(legacyMap, '+15550000000', '654321', '+15551112222')).toBe(
+  it('supports the legacy { number } item shape', () => {
+    expect(resolveCounterparty(legacy, '+15551112222', '+15550000000')).toBe(
       '+15559990000'
     );
   });
 
-  it('falls back to the default number when digits are not in the map', () => {
-    expect(resolveRealNumber(pairMap, '+15550000000', '000000', '+15551110000')).toBe(
-      '+15550000000'
-    );
+  it('accepts a bare array entry (defensive)', () => {
+    expect(
+      resolveCounterparty(
+        ['+15551110000', '+15552220000'],
+        '+15551110000',
+        '+15550000000'
+      )
+    ).toBe('+15552220000');
   });
 
-  it('falls back to the default number when the map JSON is malformed', () => {
-    expect(resolveRealNumber('{not json', '+15550000000', '123456', '+15551110000')).toBe(
+  it('falls back to the default when the entry is null (code not found)', () => {
+    expect(resolveCounterparty(null, '+15551110000', '+15550000000')).toBe(
       '+15550000000'
     );
   });
 
   it('returns empty string when nothing resolves', () => {
-    expect(resolveRealNumber(undefined, undefined, '123456', '+15551110000')).toBe('');
+    expect(resolveCounterparty(null, '+15551110000', undefined)).toBe('');
   });
 });

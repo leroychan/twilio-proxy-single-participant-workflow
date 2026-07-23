@@ -8,8 +8,9 @@ import {
 import type * as Helpers from '../assets/helpers.private';
 
 type LookupContext = {
-  LOOKUP_MAP?: string;
+  SYNC_SERVICE_SID?: string;
   DEFAULT_REAL_NUMBER?: string;
+  getTwilioClient: () => any;
 };
 
 type LookupEvent = {
@@ -17,7 +18,7 @@ type LookupEvent = {
   From?: string;
 };
 
-export const handler: ServerlessFunctionSignature = function (
+export const handler: ServerlessFunctionSignature = async function (
   context: Context<LookupContext>,
   event: ServerlessEventObject<LookupEvent>,
   callback: ServerlessCallback
@@ -26,11 +27,21 @@ export const handler: ServerlessFunctionSignature = function (
   const helpers = require(Runtime.getAssets()['/helpers.js']
     .path) as typeof Helpers;
 
-  const realNumber = helpers.resolveRealNumber(
-    context.LOOKUP_MAP,
-    context.DEFAULT_REAL_NUMBER,
-    event.Digits,
-    event.From
+  const syncServiceSid = context.SYNC_SERVICE_SID || 'default';
+  const client = context.getTwilioClient();
+
+  // The order → parties mapping lives in the Sync `lookup` Map (seeded by
+  // `npm run seed:lookup`), so it's managed data rather than config.
+  const entry = await helpers.getLookupEntry(
+    client,
+    syncServiceSid,
+    helpers.LOOKUP_SYNC_MAP_NAME,
+    event.Digits
+  );
+  const realNumber = helpers.resolveCounterparty(
+    entry,
+    event.From,
+    context.DEFAULT_REAL_NUMBER
   );
 
   const response = new Twilio.Response();
