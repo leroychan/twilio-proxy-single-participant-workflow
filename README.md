@@ -17,7 +17,6 @@ A caller dials a Proxy number that has no active session for them. Instead of fa
   - [Why Proxy auto-creates the session (not us)](#why-proxy-auto-creates-the-session-not-us)
   - [Why the resolution travels through Twilio Sync](#why-the-resolution-travels-through-twilio-sync)
   - [The redirect trick](#the-redirect-trick)
-  - [Number masking (what each party sees)](#number-masking-what-each-party-sees)
 - [How the lookup works (bidirectional)](#how-the-lookup-works-bidirectional)
 - [Data stores & schema](#data-stores--schema)
 - [Environment variables](#environment-variables)
@@ -139,11 +138,11 @@ sequenceDiagram
     Proxy->>OOS: POST Out-of-Session Callback (2nd bounce, still no session)
     OOS->>Sync: read resolution for CallSid
     Sync-->>OOS: { realNumber }
-    OOS->>Sync: delete document (best-effort; ttl backstops)
-    OOS-->>Proxy: JSON { uniqueName, ttl:300, mode:voice-only, participantIdentifier }
-    Proxy->>Proxy: Auto-create session; bind caller to dialed (reserved) number
+    OOS->>Sync: delete document (best-effort, ttl backstops)
+    OOS-->>Proxy: JSON uniqueName, ttl 300, mode voice-only, participantIdentifier
+    Proxy->>Proxy: Auto-create session, bind caller to dialed (reserved) number
     Proxy->>Dest: Dials destination via a pool proxy number
-    Caller<<->>Dest: Connected through Proxy
+    Caller->>Dest: Connected through Proxy
 
     Note over Proxy,CB: 4. Lifecycle events + early cleanup
     Proxy->>CB: POST /callback (X-Twilio-Signature, outbound leg status)
@@ -320,34 +319,6 @@ Redirecting the live call to this URL hands the still-live PSTN call back to
 Proxy. Since no session matches it yet, Proxy fires the Out-of-Session Callback
 a second time — and *that* bounce (now armed with the Sync resolution) returns
 the auto-create JSON that stands up the session and connects the call.
-
-### Number masking (what each party sees)
-
-Once bridged, **each party sees the *other* party's proxy number as the caller
-ID — never the other's real number, and never their own proxy number.** Twilio
-assigns each participant one proxy number from the pool; per the
-[Proxy Participant docs](https://www.twilio.com/docs/proxy/api/participant), a
-participant's `proxy_identifier` is:
-
-> "The phone number or short code (masked number) of the participant's partner.
-> The participant will call or message the partner participant at this number."
-
-So masking is symmetric and stable. If the caller dialed in on pool number `P1`
-and the destination is reached on `P2`:
-
-| Party | Sees as caller ID | Can call back on | To reach |
-|-------|-------------------|------------------|----------|
-| Caller | `P2` (destination's proxy #) | `P2` | the destination |
-| Destination | `P1` (caller's proxy #) | `P1` | the caller |
-
-Either party can dial the masked number back later and be reconnected through
-the same pairing.
-
-> **Gotcha:** the Out-of-Session Callback payload's
-> `outboundParticipantProxyIdentifier` is the number assigned to *represent*
-> that participant to the other side (the inverse perspective), so it will
-> **not** match the caller ID that participant actually sees. Trust the outbound
-> call record's `from` field for the real displayed caller ID.
 
 ---
 
