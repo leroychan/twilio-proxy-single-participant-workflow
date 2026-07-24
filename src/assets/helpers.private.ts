@@ -22,6 +22,18 @@ type SyncClient = {
             fetch: () => Promise<{ data?: Record<string, unknown> }>;
           };
         };
+        syncStreams: ((name: string) => {
+          streamMessages: {
+            create: (opts: {
+              data: Record<string, unknown>;
+            }) => Promise<unknown>;
+          };
+        }) & {
+          create: (opts: {
+            uniqueName: string;
+            ttl?: number;
+          }) => Promise<unknown>;
+        };
       };
     };
   };
@@ -197,4 +209,64 @@ export function resolveCounterparty(
     return single;
   }
   return defaultNumber ?? '';
+}
+
+// ---------------------------------------------------------------------------
+// Live-feed events (published to a Sync Stream, consumed by the demo-ui).
+// ---------------------------------------------------------------------------
+
+export type DemoEventType =
+  | 'oos.prompt'
+  | 'lookup.request'
+  | 'lookup.result'
+  | 'resolution.stored'
+  | 'oos.autocreate';
+
+export type DemoEvent = {
+  type: DemoEventType;
+  ts: string;
+  callSid?: string;
+  from?: string;
+  to?: string;
+  digits?: string;
+  realNumber?: string;
+  note?: string;
+};
+
+// Name of the Sync Stream the demo-ui subscribes to. Keep in sync with the
+// demo-ui token scope (demo-ui/app/api/token/route.ts).
+export const EVENTS_STREAM_NAME = 'demo-events';
+
+/**
+ * Publish a demo event to the `demo-events` Sync Stream. BEST-EFFORT: this must
+ * never throw and never change a webhook's behavior. If the stream doesn't
+ * exist yet the first publish 404s, so we create it and retry once; any final
+ * error is swallowed.
+ */
+export async function publishEvent(
+  client: SyncClient,
+  syncServiceSid: string,
+  event: DemoEvent
+): Promise<void> {
+  const service = () => client.sync.v1.services(syncServiceSid);
+  try {
+    await service()
+      .syncStreams(EVENTS_STREAM_NAME)
+      .streamMessages.create({ data: event as unknown as Record<string, unknown> });
+    return;
+  } catch {
+    // Stream likely missing — create it below and retry once.
+  }
+  try {
+    await service().syncStreams.create({ uniqueName: EVENTS_STREAM_NAME });
+  } catch {
+    // already exists / transient — ignore
+  }
+  try {
+    await service()
+      .syncStreams(EVENTS_STREAM_NAME)
+      .streamMessages.create({ data: event as unknown as Record<string, unknown> });
+  } catch {
+    // Give up silently: publishing must never break the call flow.
+  }
 }
