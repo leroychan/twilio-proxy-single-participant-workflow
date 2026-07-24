@@ -1,0 +1,26 @@
+{
+  "app": { "title": "Twilio Proxy — Dynamic Session Demo" },
+  "nav": { "dashboard": "Dashboard", "mappings": "Mappings", "settings": "Settings" },
+  "liveFeed": {
+    "title": "Live flow",
+    "empty": "Waiting for call activity…",
+    "oosPrompt": "Caller reached the number — prompting for code",
+    "lookupRequest": "Resolving counterparty for code {{digits}}",
+    "lookupResult": "Resolved counterparty",
+    "resolutionStored": "Temporary mapping stored",
+    "oosAutocreate": "Session auto-created — bridging call"
+  },
+  "reserved": { "title": "Reserved numbers", "callThis": "Call this number" },
+  "staging": { "courier": "Courier", "buyer": "Buyer", "dropHint": "Place phone here" },
+  "mappings": {
+    "title": "Mappings", "code": "Code", "partyA": "Party A", "partyB": "Party B",
+    "actions": "Actions", "add": "Add mapping", "edit": "Edit", "delete": "Delete",
+    "save": "Save", "cancel": "Cancel", "confirmDelete": "Delete mapping {{code}}?"
+  },
+  "settings": {
+    "title": "Settings", "cardStyle": "Reserved-number card style",
+    "parcelSlip": "Parcel slip", "boardingPass": "Boarding pass", "plainCard": "Plain card",
+    "labels": "Staging labels", "courierLabel": "Courier label", "buyerLabel": "Buyer label",
+    "theme": "Theme", "language": "Language"
+  }
+}

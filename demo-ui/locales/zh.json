@@ -1,0 +1,26 @@
+{
+  "app": { "title": "Twilio Proxy — 动态会话演示" },
+  "nav": { "dashboard": "仪表盘", "mappings": "映射", "settings": "设置" },
+  "liveFeed": {
+    "title": "实时流程",
+    "empty": "等待通话活动……",
+    "oosPrompt": "来电已接入 — 正在提示输入代码",
+    "lookupRequest": "正在解析代码 {{digits}} 的对方号码",
+    "lookupResult": "已解析对方号码",
+    "resolutionStored": "已存储临时映射",
+    "oosAutocreate": "会话已自动创建 — 正在接通"
+  },
+  "reserved": { "title": "预留号码", "callThis": "拨打此号码" },
+  "staging": { "courier": "快递员", "buyer": "买家", "dropHint": "将手机放在此处" },
+  "mappings": {
+    "title": "映射", "code": "代码", "partyA": "甲方", "partyB": "乙方",
+    "actions": "操作", "add": "添加映射", "edit": "编辑", "delete": "删除",
+    "save": "保存", "cancel": "取消", "confirmDelete": "删除映射 {{code}}？"
+  },
+  "settings": {
+    "title": "设置", "cardStyle": "预留号码卡片样式",
+    "parcelSlip": "快递单", "boardingPass": "登机牌", "plainCard": "普通卡片",
+    "labels": "标签", "courierLabel": "快递员标签", "buyerLabel": "买家标签",
+    "theme": "主题", "language": "语言"
+  }
+}
