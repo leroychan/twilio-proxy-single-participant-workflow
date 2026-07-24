@@ -82,6 +82,13 @@ export const handler: ServerlessFunctionSignature = async function (
         mode: 'voice-only',
         participantIdentifier: realNumber,
       };
+      await helpers.publishEvent(client, syncServiceSid, {
+        type: 'oos.autocreate',
+        ts: new Date().toISOString(),
+        callSid: CallSid,
+        from: From,
+        realNumber,
+      });
       // Consumed — best-effort cleanup (the Sync TTL is the real backstop).
       await helpers.deleteResolution(client, syncServiceSid, CallSid);
       console.log(
@@ -92,7 +99,16 @@ export const handler: ServerlessFunctionSignature = async function (
     }
   }
 
-  // First bounce (no resolution yet): prompt the caller for their code.
+  // First bounce (no resolution yet): announce and prompt for the code.
+  if (CallSid) {
+    const client = context.getTwilioClient();
+    await helpers.publishEvent(client, syncServiceSid, {
+      type: 'oos.prompt',
+      ts: new Date().toISOString(),
+      callSid: CallSid,
+      from: From,
+    });
+  }
   const baseUrl = helpers.getBaseUrl(context);
   return callback(null, gatherResponse(baseUrl));
 };

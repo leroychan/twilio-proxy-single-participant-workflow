@@ -90,6 +90,13 @@ export const handler: ServerlessFunctionSignature = async function (
     const client = context.getTwilioClient();
     const syncServiceSid = context.SYNC_SERVICE_SID || 'default';
     await helpers.saveResolution(client, syncServiceSid, CallSid, realNumber);
+    await helpers.publishEvent(client, syncServiceSid, {
+      type: 'resolution.stored',
+      ts: new Date().toISOString(),
+      callSid: CallSid,
+      from: From,
+      realNumber,
+    });
     console.log(
       `Stored resolution in Sync: CallSid=${CallSid} -> ${realNumber}.`
     );

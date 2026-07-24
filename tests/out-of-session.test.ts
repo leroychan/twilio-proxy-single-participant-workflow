@@ -4,11 +4,18 @@ import { handler } from '../src/functions/out-of-session';
 const documentFetch = jest.fn();
 const documentRemove = jest.fn();
 
+// add alongside the existing documents mock:
+const streamMessagesCreate = jest.fn().mockResolvedValue({});
+const syncStreams: any = jest.fn(() => ({
+  streamMessages: { create: streamMessagesCreate },
+}));
+syncStreams.create = jest.fn().mockResolvedValue({});
+
 function makeContext(extra: Record<string, unknown> = {}) {
   // client.sync.v1.services(sid).documents(key).fetch()/.remove()
   const documentInstance = { fetch: documentFetch, remove: documentRemove };
   const documents: any = jest.fn(() => documentInstance);
-  const syncService = { documents };
+  const syncService = { documents, syncStreams };
   const client = { sync: { v1: { services: jest.fn(() => syncService) } } };
 
   return {
@@ -29,6 +36,7 @@ function invoke(context: any, event: any): Promise<any> {
 }
 
 beforeEach(() => {
+  streamMessagesCreate.mockReset().mockResolvedValue({});
   (global as any).Runtime = {
     getAssets: () => ({
       '/helpers.js': {
@@ -56,6 +64,9 @@ it('returns a Gather on the first bounce (no resolution stored yet)', async () =
   expect(body).toContain('action="https://svc-1234-dev.twil.io/gather-action"');
   expect(body).toContain('<Say>Please enter your order number.</Say>');
   expect(documentRemove).not.toHaveBeenCalled();
+
+  const types = streamMessagesCreate.mock.calls.map((c: any[]) => c[0].data.type);
+  expect(types).toContain('oos.prompt');
 });
 
 it('returns the auto-create JSON on the second bounce (resolution present)', async () => {
@@ -76,6 +87,9 @@ it('returns the auto-create JSON on the second bounce (resolution present)', asy
 
   // the consumed resolution is deleted (best-effort)
   expect(documentRemove).toHaveBeenCalledTimes(1);
+
+  const types = streamMessagesCreate.mock.calls.map((c: any[]) => c[0].data.type);
+  expect(types).toContain('oos.autocreate');
 });
 
 it('falls back to a Gather when there is no CallSid to key on', async () => {
