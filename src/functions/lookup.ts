@@ -30,6 +30,14 @@ export const handler: ServerlessFunctionSignature = async function (
   const syncServiceSid = context.SYNC_SERVICE_SID || 'default';
   const client = context.getTwilioClient();
 
+  const ts = () => new Date().toISOString();
+  await helpers.publishEvent(client, syncServiceSid, {
+    type: 'lookup.request',
+    ts: ts(),
+    from: event.From,
+    digits: event.Digits,
+  });
+
   // The order → parties mapping lives in the Sync `lookup` Map (seeded by
   // `npm run seed:lookup`), so it's managed data rather than config.
   const entry = await helpers.getLookupEntry(
@@ -43,6 +51,14 @@ export const handler: ServerlessFunctionSignature = async function (
     event.From,
     context.DEFAULT_REAL_NUMBER
   );
+
+  await helpers.publishEvent(client, syncServiceSid, {
+    type: 'lookup.result',
+    ts: ts(),
+    from: event.From,
+    digits: event.Digits,
+    realNumber,
+  });
 
   const response = new Twilio.Response();
   response.appendHeader('Content-Type', 'application/json');

@@ -3,11 +3,18 @@ import { handler } from '../src/functions/gather-action';
 
 const documentsCreate = jest.fn();
 
+// add alongside the existing documents mock:
+const streamMessagesCreate = jest.fn().mockResolvedValue({});
+const syncStreams: any = jest.fn(() => ({
+  streamMessages: { create: streamMessagesCreate },
+}));
+syncStreams.create = jest.fn().mockResolvedValue({});
+
 function makeContext() {
   // client.sync.v1.services(sid).documents.create(...)
   const documents: any = jest.fn();
   documents.create = documentsCreate;
-  const syncService = { documents };
+  const syncService = { documents, syncStreams };
   const client = { sync: { v1: { services: jest.fn(() => syncService) } } };
 
   return {
@@ -20,6 +27,7 @@ function makeContext() {
 }
 
 beforeEach(() => {
+  streamMessagesCreate.mockReset().mockResolvedValue({});
   (global as any).Runtime = {
     getAssets: () => ({
       '/helpers.js': {
@@ -67,6 +75,9 @@ it('looks up the number, stashes it in Sync keyed by CallSid, and redirects', (d
         'https://webhooks.twilio.com/v1/Accounts/ACtestaccountsid00000000000000000/Proxy/KStestproxyservice0000000000000000/Webhooks/Call'
       );
       expect(response.body).toContain('<Redirect');
+
+      const types = streamMessagesCreate.mock.calls.map((c: any[]) => c[0].data.type);
+      expect(types).toContain('resolution.stored');
       done();
     }
   );

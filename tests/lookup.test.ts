@@ -3,13 +3,20 @@ import { handler } from '../src/functions/lookup';
 
 const itemFetch = jest.fn();
 
+// add alongside the existing syncMaps mock:
+const streamMessagesCreate = jest.fn().mockResolvedValue({});
+const syncStreams: any = jest.fn(() => ({
+  streamMessages: { create: streamMessagesCreate },
+}));
+syncStreams.create = jest.fn().mockResolvedValue({});
+
 function makeContext() {
   // client.sync.v1.services(sid).syncMaps(name).syncMapItems(key).fetch()
   const itemInstance = { fetch: itemFetch };
   const syncMapInstance = { syncMapItems: jest.fn(() => itemInstance) };
   const syncMaps = jest.fn(() => syncMapInstance);
   const client = {
-    sync: { v1: { services: jest.fn(() => ({ syncMaps })) } },
+    sync: { v1: { services: jest.fn(() => ({ syncMaps, syncStreams })) } },
   };
 
   return {
@@ -29,6 +36,7 @@ function invoke(context: any, event: any): Promise<any> {
 }
 
 beforeEach(() => {
+  streamMessagesCreate.mockReset().mockResolvedValue({});
   (global as any).Runtime = {
     getAssets: () => ({
       '/helpers.js': {
@@ -50,6 +58,12 @@ it('returns the other party (B) as JSON when party A calls', async () => {
 
   expect(response.headers['Content-Type']).toBe('application/json');
   expect(response.body).toEqual({ realNumber: '+15551230000' });
+
+  const published = streamMessagesCreate.mock.calls.map(
+    (c: any[]) => c[0].data.type
+  );
+  expect(published).toContain('lookup.request');
+  expect(published).toContain('lookup.result');
 });
 
 it('returns the other party (A) when party B calls (opposite direction)', async () => {
