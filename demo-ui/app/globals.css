@@ -52,9 +52,6 @@ body {
 }
 
 @layer base {
-  * {
-    @apply outline-ring/50;
-  }
   html {
     @apply font-sans;
   }

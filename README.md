@@ -6,6 +6,14 @@ A caller dials a Proxy number that has no active session for them. Instead of fa
 
 ---
 
+## Demo UI
+
+A companion dashboard lives in [`demo-ui/`](./demo-ui) — a Next.js app that shows
+the live call flow, manages the Sync `lookup` mappings, and stages Courier/Buyer
+phones. See [`demo-ui/README.md`](./demo-ui/README.md).
+
+---
+
 ## Table of contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
